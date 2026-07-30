@@ -138,9 +138,9 @@ def attachment_conflict(id, object):
         return False
     return row["object"] != object
 
-# attachment_insert writes a metadata row. entity is provenance: "" for our own
+# attachment_row_write writes a metadata row. entity is provenance: "" for our own
 # (bytes local), an entity id for a remote copy (bytes pulled on demand).
-def attachment_insert(id, object, name, size, content_type, creator, caption, description, rank, created, entity):
+def attachment_row_write(id, object, name, size, content_type, creator, caption, description, rank, created, entity):
     mochi.db.execute(
         "insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
         id, object, entity, name, size, content_type, creator, caption, description, rank, created)
@@ -177,7 +177,7 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
         # File before row: a builtin error here aborts the handler with no
         # cleanup, so the benign failure is an orphan file (swept later), never
         # a row pointing at nothing.
-        attachment_insert(id, object, name, size, content_type, creator, caption, description, rank, created, "")
+        attachment_row_write(id, object, name, size, content_type, creator, caption, description, rank, created, "")
         results.append(attachment_map({
             "id": id, "object": object, "entity": "", "name": name, "size": size,
             "content_type": content_type, "creator": creator, "caption": caption,
@@ -200,8 +200,8 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
         mochi.file.write(attachment_filename(id, name), data)
     rank = attachment_next_rank(object)
     created = mochi.time.now()
-    attachment_insert(id, object, name, len(data), content_type, "", caption, description, rank, created, entity)
-    return attachment_map(attachment_row(id), None, "")
+    attachment_row_write(id, object, name, len(data), content_type, "", caption, description, rank, created, entity)
+    return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_receive(object, name, stream, content_type="", id="") stores an
 # attachment whose bytes arrive on an open stream (a source pulling an upload
@@ -219,8 +219,21 @@ def attachment_receive(object, name, stream, content_type="", id=""):
         mochi.file.delete(filename)
         return None
     rank = attachment_next_rank(object)
-    attachment_insert(id, object, name, size, content_type, "", "", "", rank, mochi.time.now(), "")
-    return attachment_map(attachment_row(id), None, "")
+    attachment_row_write(id, object, name, size, content_type, "", "", "", rank, mochi.time.now(), "")
+    return attachment_map(attachment_row(id), mochi.app.url(), "")
+
+# attachment_insert(object, name, data, position, content_type="", caption="",
+# description="") stores an attachment from bytes at a specific 1-based rank,
+# shifting later attachments down. Returns the response dict.
+def attachment_insert(object, name, data, position, content_type="", caption="", description=""):
+    id = mochi.uid()
+    if not content_type:
+        content_type = attachment_content_type(name)
+    mochi.file.write(attachment_filename(id, name), data)
+    mochi.db.execute("update attachments set rank = rank + 1 where object=? and rank >= ?", object, position)
+    created = mochi.time.now()
+    attachment_row_write(id, object, name, len(data), content_type, "", caption, description, position, created, "")
+    return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_list(object, entity="") returns object's attachments ordered by
 # rank, as response dicts. Pass the route entity to get public entity-scoped
@@ -548,7 +561,7 @@ def attachment_migrate():
         id = att.get("id")
         if not id or attachment_exists(id):
             continue
-        attachment_insert(
+        attachment_row_write(
             id, att.get("object", ""), att.get("name", ""), att.get("size", 0),
             att.get("content_type", ""), att.get("creator", ""), att.get("caption", ""),
             att.get("description", ""), att.get("rank", 0),
