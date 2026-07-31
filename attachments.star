@@ -404,21 +404,74 @@ def attachment_bound(row, container, member=None):
 def attachment_store(rows, entity, object=None):
     count = 0
     for att in rows:
+        if type(att) != "dict":
+            continue
         id = att.get("id")
-        if not id:
+        if not attachment_identifier(id):
             continue
         target = object if object != None else att.get("object", "")
-        if not target:
+        if type(target) != "string" or not target:
             continue
         if attachment_conflict(id, target):
             continue
-        created = att.get("created", 0) or mochi.time.now()
+        created = attachment_number(att.get("created", 0)) or mochi.time.now()
         mochi.db.execute(
             "insert or replace into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
-            id, target, entity, att.get("name", ""), att.get("size", 0), att.get("content_type", ""),
-            att.get("creator", ""), att.get("caption", ""), att.get("description", ""), att.get("rank", 0), created)
+            id, target, entity,
+            attachment_text(att.get("name", ""), attachment_name_maximum),
+            attachment_number(att.get("size", 0)),
+            attachment_text(att.get("content_type", ""), attachment_name_maximum),
+            attachment_text(att.get("creator", ""), attachment_name_maximum),
+            attachment_text(att.get("caption", ""), attachment_text_maximum),
+            attachment_text(att.get("description", ""), attachment_text_maximum),
+            attachment_number(att.get("rank", 0)), created)
         count = count + 1
     return count
+
+# A peer's row is data, not a promise about its own shape. The three helpers
+# below reduce each field to the type the rest of the library assumes, because
+# the caller's authorisation answers whether this peer may send us anything at
+# all - not whether what arrived is well formed. A field of the wrong type is
+# not inert: a name that is a number reaches name.lower() in
+# attachment_is_image and aborts the handler, which Starlark gives no way to
+# recover from.
+
+attachment_name_maximum = 255
+attachment_text_maximum = 1000
+
+# attachment_identifier reports whether id is a well formed attachment id: 32
+# characters of lowercase alphanumeric, matching what core accepts. A malformed
+# one cannot address anything - it becomes a cache name core's own path check
+# refuses - so the row would never resolve and is dropped instead.
+def attachment_identifier(id):
+    if type(id) != "string" or len(id) != 32:
+        return False
+    for i in range(len(id)):
+        if id[i] not in "0123456789abcdefghijklmnopqrstuvwxyz":
+            return False
+    return True
+
+# attachment_text reduces a field to a string of at most maximum characters.
+# Anything that is not a string reads as absent rather than rejecting the row,
+# so one malformed field costs a caption and not the attachment.
+def attachment_text(value, maximum):
+    if type(value) != "string":
+        return ""
+    if len(value) > maximum:
+        return value[:maximum]
+    return value
+
+# attachment_number reduces a field to a non-negative integer. Floats are
+# expected rather than exceptional: a number crossing the network as JSON
+# arrives as one.
+def attachment_number(value):
+    kind = type(value)
+    if kind == "int":
+        return value if value > 0 else 0
+    if kind == "float":
+        rounded = int(value)
+        return rounded if rounded > 0 else 0
+    return 0
 
 # ---------------------------------------------------------------------------
 # Byte transfer (requester and responder)
