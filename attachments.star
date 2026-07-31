@@ -527,7 +527,20 @@ def attachment_respond(e, container, authorize, member=None):
 # the file before the row, so a mid-operation abort leaves an orphan file; this
 # collects them. Run opportunistically from attachment_save. Bounded work: it
 # only inspects files whose name matches the "<id>_" attachment pattern.
-def attachment_sweep():
+#
+# age is how long a file must have gone untouched to count as abandoned. A file
+# with no row is not necessarily an orphan: another request may be part-way
+# through writing one, and until its row lands the two are indistinguishable by
+# name. Sweeping immediately would delete bytes an upload still in flight is
+# about to claim, leaving a row whose file is gone. A handler cannot outlive the
+# Starlark time limit, so anything untouched for an hour has no writer left.
+#
+# Skipped entirely where mochi.file.age is unavailable, which is how this reads
+# on a server older than the API: leaving orphans costs disk, deleting a live
+# upload costs the file.
+def attachment_sweep(age=3600):
+    if not hasattr(mochi.file, "age"):
+        return
     files = mochi.file.list("")
     if not files:
         return
@@ -541,8 +554,12 @@ def attachment_sweep():
         # hyphens removed); anything else is some other app file, left alone.
         if len(id) != 32 or not attachment_hex(id):
             continue
-        if not attachment_exists(id):
-            mochi.file.delete(fname)
+        if attachment_exists(id):
+            continue
+        settled = mochi.file.age(fname)
+        if settled == None or settled < age:
+            continue
+        mochi.file.delete(fname)
 
 # attachment_hex reports whether every character is a lowercase hex digit, so
 # the orphan sweep only touches uid-shaped names.
