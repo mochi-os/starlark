@@ -296,6 +296,52 @@ def attachment_update(id, caption, description):
     mochi.db.execute("update attachments set caption=?, description=? where id=?", caption, description, id)
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
+# attachment_copy(id, object, frm="", caption="", description="") duplicates an
+# attachment onto another object and returns the new response dict, or None if
+# the bytes cannot be obtained. The bytes stream from one file to the other and
+# are never held in memory, which is what separates this from reading with
+# attachment_data and writing back with attachment_create: an attachment may be
+# as large as the uploader's remaining quota, and the Starlark interpreter
+# shares its process with every other user on the host.
+#
+# The copy is always ours (entity ""), because a forwarded or duplicated
+# attachment is no longer a reference to the peer's: for a remote source the
+# bytes are pulled into cache first and then kept.
+def attachment_copy(id, object, frm="", caption="", description=""):
+    row = attachment_row(id)
+    if not row:
+        return None
+
+    new = mochi.uid()
+    name = row["name"]
+    destination = attachment_filename(new, name)
+
+    if row.get("entity"):
+        if not attachment_pull(id, row, frm):
+            return None
+        size = mochi.cache.copy(attachment_cache_name(id), destination)
+    else:
+        size = mochi.file.copy(attachment_filename(id, name), destination)
+    if size == None:
+        return None
+
+    attachment_row_write(new, object, name, size, row.get("content_type", ""), "",
+                         caption, description, attachment_next_rank(object), mochi.time.now(), "")
+    return attachment_map(attachment_row(new), mochi.app.url(), "")
+
+# attachment_fetch(id, frm="") makes sure a remote attachment's bytes are in
+# cache, returning whether they are available. For a row we hold locally there
+# is nothing to do. Callers that only want to warm the cache use this rather
+# than attachment_data, whose return value they would discard - and which would
+# read the whole object into memory to produce it.
+def attachment_fetch(id, frm=""):
+    row = attachment_row(id)
+    if not row:
+        return False
+    if not row.get("entity"):
+        return True
+    return attachment_pull(id, row, frm)
+
 # attachment_data(id, frm="") returns an attachment's bytes, or None. For an own
 # row it reads local storage; for a remote row it pulls from the source on
 # demand (as the old mochi.attachment.data did) and returns the cached copy.
