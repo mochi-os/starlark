@@ -131,7 +131,8 @@ def attachment_row(id):
 # attachment_conflict reports whether id already exists bound to a different
 # object. The receive paths write ids chosen by a peer; an id already held under
 # another object must not be repointed (that would detach an attachment from the
-# message it belongs to). Re-storing under the same object is an ordinary update.
+# message it belongs to). Re-storing under the same object is an ordinary update
+# of the descriptive fields; attachment_store keeps provenance out of it.
 def attachment_conflict(id, object):
     row = mochi.db.row("select object from attachments where id=?", id)
     if not row:
@@ -414,17 +415,35 @@ def attachment_store(rows, entity, object=None):
             continue
         if attachment_conflict(id, target):
             continue
-        created = attachment_number(att.get("created", 0)) or mochi.time.now()
+
+        name = attachment_text(att.get("name", ""), attachment_name_maximum)
+        size = attachment_number(att.get("size", 0))
+        content_type = attachment_text(att.get("content_type", ""), attachment_name_maximum)
+        caption = attachment_text(att.get("caption", ""), attachment_text_maximum)
+        description = attachment_text(att.get("description", ""), attachment_text_maximum)
+        rank = attachment_number(att.get("rank", 0))
+
+        # An id we already hold under this object is a metadata update, and the
+        # sender does not get to restate where the bytes come from. entity is
+        # what decides that - "" reads our own file, an entity id pulls from that
+        # peer - so overwriting it turns a file we stored into one fetched from
+        # whoever sent the update, under its original name. creator and created
+        # are the same kind of claim about the past. Only the descriptive fields
+        # move.
+        existing = attachment_row(id)
+        if existing:
+            mochi.db.execute(
+                "update attachments set name=?, size=?, content_type=?, caption=?, description=?, rank=? where id=?",
+                name, size, content_type, caption, description, rank, id)
+            count = count + 1
+            continue
+
         mochi.db.execute(
-            "insert or replace into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
-            id, target, entity,
-            attachment_text(att.get("name", ""), attachment_name_maximum),
-            attachment_number(att.get("size", 0)),
-            attachment_text(att.get("content_type", ""), attachment_name_maximum),
+            "insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
+            id, target, entity, name, size, content_type,
             attachment_text(att.get("creator", ""), attachment_name_maximum),
-            attachment_text(att.get("caption", ""), attachment_text_maximum),
-            attachment_text(att.get("description", ""), attachment_text_maximum),
-            attachment_number(att.get("rank", 0)), created)
+            caption, description, rank,
+            attachment_number(att.get("created", 0)) or mochi.time.now())
         count = count + 1
     return count
 
