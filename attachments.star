@@ -537,10 +537,20 @@ def attachment_sweep():
         if under <= 0:
             continue
         id = fname[:under]
-        if len(id) < 40:
-            continue  # not a uid-shaped attachment file
+        # An attachment id is a 32-character hex uid (mochi.uid with the UUID
+        # hyphens removed); anything else is some other app file, left alone.
+        if len(id) != 32 or not attachment_hex(id):
+            continue
         if not attachment_exists(id):
             mochi.file.delete(fname)
+
+# attachment_hex reports whether every character is a lowercase hex digit, so
+# the orphan sweep only touches uid-shaped names.
+def attachment_hex(s):
+    for i in range(len(s)):
+        if s[i] not in "0123456789abcdef":
+            return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Migration (transition bridge)
