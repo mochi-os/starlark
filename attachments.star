@@ -342,6 +342,41 @@ def attachment_fetch(id, frm=""):
         return True
     return attachment_pull(id, row, frm)
 
+# attachment_entry(id, name, frm="") returns a mochi.archive.write entry naming
+# this attachment's bytes, or None if they cannot be obtained. Pair it with
+# attachment_extract on the way back in. This is how an export carries
+# attachments: the archive streams each one straight off disk, where embedding
+# them in the export's own JSON meant holding every one of them, base64-expanded
+# by a third, in memory at the same time.
+#
+# A remote copy is pulled into cache first and referenced there, so exporting a
+# subscribed container's attachments does not first turn them into ours.
+def attachment_entry(id, name, frm=""):
+    row = attachment_row(id)
+    if not row:
+        return None
+    if row.get("entity"):
+        if not attachment_pull(id, row, frm):
+            return None
+        return {"name": name, "cache": attachment_cache_name(id)}
+    return {"name": name, "file": attachment_filename(id, row["name"])}
+
+# attachment_extract(archive, entry, object, name, ...) stores one entry of an
+# archive as an attachment on object and returns the response dict, or None if
+# the entry is absent. The bytes go from the container to their resting place
+# without being read, which is the half of an import that used to decode a
+# base64 string per attachment and hold the result.
+def attachment_extract(archive, entry, object, name, content_type="", caption="", description=""):
+    id = mochi.uid()
+    size = mochi.archive.extract(archive, entry, attachment_filename(id, name))
+    if size == None:
+        return None
+    if not content_type:
+        content_type = attachment_content_type(name)
+    attachment_row_write(id, object, name, size, content_type, "", caption, description,
+                         attachment_next_rank(object), mochi.time.now(), "")
+    return attachment_map(attachment_row(id), mochi.app.url(), "")
+
 # attachment_data(id, frm="") returns an attachment's bytes, or None. For an own
 # row it reads local storage; for a remote row it pulls from the source on
 # demand (as the old mochi.attachment.data did) and returns the cached copy.
