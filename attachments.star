@@ -51,35 +51,30 @@ def attachment_schema_create():
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-# The storage filename for an attachment. Matches core's attachment_filename so
-# migrated files are found in place. filepath.Base defence against separators is
-# applied by stripping path components.
-def attachment_filename(id, name):
-    safe = name
-    for sep in ["/", "\\"]:
-        if sep in safe:
-            safe = safe.split(sep)[-1]
-    if safe == "" or safe == "." or safe == "..":
-        safe = "file"
-    # The id and its separator take 33 characters of the filesystem's 255-byte
-    # component budget, so a name close to the limit only fails once the bytes
-    # have already been streamed to disk. Trim the stem and keep the extension,
-    # which is what decides the content type on the way back out.
-    room = attachment_component_maximum - len(id) - 1
-    if len(safe) > room:
-        stem = safe
-        extension = ""
-        if "." in safe:
-            index = safe.rindex(".")
-            # A leading dot is the whole name, not an extension.
-            if index > 0 and len(safe) - index <= 16:
-                stem = safe[:index]
-                extension = safe[index:]
-        safe = stem[:room - len(extension)] + extension
-    return id + "_" + safe
-
-# The longest filename most filesystems accept for one path component.
+# The longest filename most filesystems accept for one path component. The id
+# and its separator spend 33 bytes of it, so this is the room a name has.
 attachment_component_maximum = 255
+
+# The storage filename for an attachment: the id, a separator, and the cleaned
+# name - readable on disk for debugging, unique and sweep-parseable through the
+# id. Core's mochi.file.clean owns the rules, and shares its implementation
+# with the validator every file API applies, so a name this returns cannot be
+# refused later. A predecessor sanitised by hand in Starlark, predicting what
+# the Go validator would accept, and predicted wrongly: every non-ASCII name -
+# anyone naming a file in their own language - failed after the bytes were
+# already streamed to disk.
+def attachment_filename(id, name):
+    return id + "_" + mochi.file.clean(name, attachment_component_maximum - len(id) - 1)
+
+# attachment_name is the canonical form of a client-supplied name, applied once
+# where a name enters the library - upload, create, receive, store - so the
+# name column, the response dicts, the P2P rows and the disk suffix all hold
+# the same string and every consumer downstream inherits its safety. For any
+# ordinary name in any script this is the identity.
+def attachment_name(name):
+    if type(name) != "string":
+        name = str(name)
+    return mochi.file.clean(name, attachment_component_maximum - 33)
 
 def attachment_is_image(name):
     lower = name.lower()
@@ -193,7 +188,10 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
     files = a.files(field)
     for i in range(len(files)):
         meta = files[i]
-        name = meta["name"]
+        # Canonical at the boundary: the browser sends whatever the user's own
+        # filesystem allowed, and this is the one name everything downstream -
+        # column, disk, responses, P2P rows - will carry.
+        name = attachment_name(meta["name"])
         id = mochi.uid()
         filename = attachment_filename(id, name)
         # Bounded against core's own figure rather than a copy of it. An
@@ -225,6 +223,7 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
 # hand (a copy, a decoded payload). Pass id to preserve an existing identifier
 # (federation), entity for a remote-provenance row.
 def attachment_create(object, name, data, content_type="", caption="", description="", id="", entity=""):
+    name = attachment_name(name)
     # Same ceiling as the upload path: bytes already in hand are no different
     # from bytes arriving over HTTP once they are an attachment.
     if not entity and len(data) > mochi.file.maximum():
@@ -245,6 +244,7 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
 # and records an own row (entity ""). Returns the response dict, or None if the
 # stream carried nothing. Pass id to preserve a federated identifier.
 def attachment_receive(object, name, stream, content_type="", id=""):
+    name = attachment_name(name)
     if not id:
         id = mochi.uid()
     if not content_type:
@@ -576,7 +576,10 @@ def attachment_store(rows, entity, object=None):
         if attachment_conflict(id, target):
             continue
 
-        name = attachment_text(att.get("name", ""), attachment_name_maximum)
+        # A peer's name is a claim like the rest of its row: the same canonical
+        # form the local paths apply, so nothing peer-shaped reaches the disk
+        # name or a Content-Disposition header.
+        name = attachment_name(attachment_text(att.get("name", ""), attachment_name_maximum))
         size = attachment_number(att.get("size", 0))
         content_type = attachment_text(att.get("content_type", ""), attachment_name_maximum)
         caption = attachment_text(att.get("caption", ""), attachment_text_maximum)
@@ -821,6 +824,12 @@ def attachment_sweep(age=3600):
         if len(id) != 32 or not attachment_hex(id):
             continue
         if attachment_exists(id):
+            continue
+        # A disk name the validator refuses was written under an older rule;
+        # mochi.file.age would abort the handler on it, and one such file must
+        # not cost the user every future upload. Left alone rather than deleted:
+        # refusing to sweep a name is safe, deleting it is not.
+        if not mochi.text.valid(fname, "filepath"):
             continue
         settled = mochi.file.age(fname)
         if settled == None or settled < age:
