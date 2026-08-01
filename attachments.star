@@ -61,7 +61,25 @@ def attachment_filename(id, name):
             safe = safe.split(sep)[-1]
     if safe == "" or safe == "." or safe == "..":
         safe = "file"
+    # The id and its separator take 33 characters of the filesystem's 255-byte
+    # component budget, so a name close to the limit only fails once the bytes
+    # have already been streamed to disk. Trim the stem and keep the extension,
+    # which is what decides the content type on the way back out.
+    room = attachment_component_maximum - len(id) - 1
+    if len(safe) > room:
+        stem = safe
+        extension = ""
+        if "." in safe:
+            index = safe.rindex(".")
+            # A leading dot is the whole name, not an extension.
+            if index > 0 and len(safe) - index <= 16:
+                stem = safe[:index]
+                extension = safe[index:]
+        safe = stem[:room - len(extension)] + extension
     return id + "_" + safe
+
+# The longest filename most filesystems accept for one path component.
+attachment_component_maximum = 255
 
 def attachment_is_image(name):
     lower = name.lower()
@@ -87,6 +105,17 @@ def attachment_next_rank(object):
     if row and row.get("high") != None:
         return int(row["high"]) + 1
     return 1
+
+# attachment_row_append writes a row at the end of object's order, choosing the
+# rank inside the insert rather than reading it first. Two statements - read the
+# maximum, then write it back - can interleave with another request doing the
+# same, and both then claim the same rank; handlers are not serialised per user,
+# so two uploads to one object race on every save. One statement cannot.
+def attachment_row_append(id, object, name, size, content_type, creator, caption, description, created, entity):
+    mochi.db.execute(
+        """insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created )
+           values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ( select coalesce( max( rank ), 0 ) + 1 from attachments where object=? ), ? )""",
+        id, object, entity, name, size, content_type, creator, caption, description, object, created)
 
 # attachment_url reproduces the URL shapes core built, so the response shape
 # apps' web and Android clients consume is unchanged. With an entity: the public
@@ -176,12 +205,12 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
             content_type = attachment_content_type(name)
         caption = captions[i] if i < len(captions) else ""
         description = descriptions[i] if i < len(descriptions) else ""
-        rank = attachment_next_rank(object)
         created = mochi.time.now()
         # File before row: a builtin error here aborts the handler with no
         # cleanup, so the benign failure is an orphan file (swept later), never
         # a row pointing at nothing.
-        attachment_row_write(id, object, name, size, content_type, creator, caption, description, rank, created, "")
+        attachment_row_append(id, object, name, size, content_type, creator, caption, description, created, "")
+        rank = attachment_row(id)["rank"]
         results.append(attachment_map({
             "id": id, "object": object, "entity": "", "name": name, "size": size,
             "content_type": content_type, "creator": creator, "caption": caption,
@@ -207,9 +236,7 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
         content_type = attachment_content_type(name)
     if not entity:
         mochi.file.write(attachment_filename(id, name), data)
-    rank = attachment_next_rank(object)
-    created = mochi.time.now()
-    attachment_row_write(id, object, name, len(data), content_type, "", caption, description, rank, created, entity)
+    attachment_row_append(id, object, name, len(data), content_type, "", caption, description, mochi.time.now(), entity)
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_receive(object, name, stream, content_type="", id="") stores an
@@ -223,12 +250,12 @@ def attachment_receive(object, name, stream, content_type="", id=""):
     if not content_type:
         content_type = attachment_content_type(name)
     filename = attachment_filename(id, name)
+    # A read that fails aborts the handler, so reaching here means the transfer
+    # succeeded - and a transfer of nothing is an empty file, which is a
+    # legitimate thing to attach. Treating zero as failure deleted it and
+    # reported nothing received, indistinguishable from a broken stream.
     size = stream.read.file(filename)
-    if not size:
-        mochi.file.delete(filename)
-        return None
-    rank = attachment_next_rank(object)
-    attachment_row_write(id, object, name, size, content_type, "", "", "", rank, mochi.time.now(), "")
+    attachment_row_append(id, object, name, size, content_type, "", "", "", mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_insert(object, name, data, position, content_type="", caption="",
@@ -238,13 +265,21 @@ def attachment_insert(object, name, data, position, content_type="", caption="",
     if len(data) > mochi.file.maximum():
         mochi.log.debug("attachment_insert refusing %s: %d bytes exceeds the object limit", name, len(data))
         return None
+    if not attachment_position(position):
+        return None
     id = mochi.uid()
     if not content_type:
         content_type = attachment_content_type(name)
     mochi.file.write(attachment_filename(id, name), data)
-    mochi.db.execute("update attachments set rank = rank + 1 where object=? and rank >= ?", object, position)
-    created = mochi.time.now()
-    attachment_row_write(id, object, name, len(data), content_type, "", caption, description, position, created, "")
+    # Shift and insert as one unit: separately, a concurrent insert at the same
+    # position shifts against a list the first has already moved, and both land
+    # on the same rank.
+    handle = mochi.db.transaction()
+    handle.execute("update attachments set rank = rank + 1 where object=? and rank >= ?", object, position)
+    handle.execute(
+        "insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, '', ?, ?, ?, '', ?, ?, ?, ? )",
+        id, object, name, len(data), content_type, caption, description, position, mochi.time.now())
+    handle.commit()
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_list(object, entity="") returns object's attachments ordered by
@@ -288,18 +323,36 @@ def attachment_clear(object):
         attachment_forget(row)
 
 def attachment_move(id, position):
+    if not attachment_position(position):
+        return None
     row = attachment_row(id)
     if not row:
         return None
     old = row["rank"]
     new = position
     if old != new:
+        # Shift and set as one unit, for the same reason the insert above is:
+        # two moves interleaving shift each other's ranges and leave the order
+        # decided by whichever statement landed last.
+        handle = mochi.db.transaction()
         if new < old:
-            mochi.db.execute("update attachments set rank = rank + 1 where object=? and rank >= ? and rank < ?", row["object"], new, old)
+            handle.execute("update attachments set rank = rank + 1 where object=? and rank >= ? and rank < ?", row["object"], new, old)
         else:
-            mochi.db.execute("update attachments set rank = rank - 1 where object=? and rank > ? and rank <= ?", row["object"], old, new)
-        mochi.db.execute("update attachments set rank=? where id=?", new, id)
+            handle.execute("update attachments set rank = rank - 1 where object=? and rank > ? and rank <= ?", row["object"], old, new)
+        handle.execute("update attachments set rank=? where id=?", new, id)
+        handle.commit()
     return attachment_map(attachment_row(id), mochi.app.url(), "")
+
+# attachment_position reports whether a caller-supplied position is a usable
+# rank. Ranks start at 1, which core required and this did not: a zero or
+# negative one puts a row below the floor every other query assumes, and one far
+# past the end leaves the shift matching nothing while the row lands beyond its
+# neighbours, so the list has a hole the next insert falls into.
+def attachment_position(position):
+    if type(position) != "int" or position < 1:
+        mochi.log.debug("attachment position %s is not a rank", str(position))
+        return False
+    return True
 
 def attachment_update(id, caption, description):
     if not attachment_exists(id):
@@ -336,8 +389,8 @@ def attachment_copy(id, object, frm="", caption="", description=""):
     if size == None:
         return None
 
-    attachment_row_write(new, object, name, size, row.get("content_type", ""), "",
-                         caption, description, attachment_next_rank(object), mochi.time.now(), "")
+    attachment_row_append(new, object, name, size, row.get("content_type", ""), "",
+                          caption, description, mochi.time.now(), "")
     return attachment_map(attachment_row(new), mochi.app.url(), "")
 
 # attachment_fetch(id, frm="") makes sure a remote attachment's bytes are in
@@ -384,8 +437,8 @@ def attachment_extract(archive, entry, object, name, content_type="", caption=""
         return None
     if not content_type:
         content_type = attachment_content_type(name)
-    attachment_row_write(id, object, name, size, content_type, "", caption, description,
-                         attachment_next_rank(object), mochi.time.now(), "")
+    attachment_row_append(id, object, name, size, content_type, "", caption, description,
+                          mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_data(id, frm="") returns an attachment's bytes, or None. For an own
