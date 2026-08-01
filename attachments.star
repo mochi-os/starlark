@@ -349,10 +349,15 @@ def attachment_move(id, position):
 # past the end leaves the shift matching nothing while the row lands beyond its
 # neighbours, so the list has a hole the next insert falls into.
 def attachment_position(position):
-    if type(position) != "int" or position < 1:
+    if type(position) != "int" or position < 1 or position > attachment_position_maximum:
         mochi.log.debug("attachment position %s is not a rank", str(position))
         return False
     return True
+
+# Ranks are database integers, and Starlark's are arbitrary precision, so the
+# ceiling matters as much as the floor: core bounded both through sl.AsInt32 and
+# a value beyond that cannot be bound as a parameter at all.
+attachment_position_maximum = 2147483647
 
 def attachment_update(id, caption, description):
     if not attachment_exists(id):
@@ -575,18 +580,26 @@ def attachment_store(rows, entity, object=None):
         description = attachment_text(att.get("description", ""), attachment_text_maximum)
         rank = attachment_number(att.get("rank", 0))
 
-        # An id we already hold under this object is a metadata update, and the
-        # sender does not get to restate where the bytes come from. entity is
-        # what decides that - "" reads our own file, an entity id pulls from that
-        # peer - so overwriting it turns a file we stored into one fetched from
-        # whoever sent the update, under its original name. creator and created
-        # are the same kind of claim about the past. Only the descriptive fields
-        # move.
+        # An id we already hold under this object is an annotation update, and
+        # the row's fields divide by what they mean rather than by what looks
+        # dangerous. name, size and content_type describe WHICH BYTES these are;
+        # entity, creator and created describe where they came from. Neither is
+        # the sender's to restate, and name least of all: the bytes live at
+        # attachment_filename(id, name), so changing it moves the address
+        # without moving the file. Nine call sites then read a path that does
+        # not exist - serving, the responder, copy, export, both variants - and
+        # a later delete unlinks the new name and drops the row, orphaning the
+        # real file under the old one.
+        #
+        # What remains is what an annotation is: caption, description, and the
+        # position in the object's order. A restatement that tries to change the
+        # rest updates these and leaves the rest alone, so a genuine re-broadcast
+        # is idempotent and a hostile one is inert.
         existing = attachment_row(id)
         if existing:
             mochi.db.execute(
-                "update attachments set name=?, size=?, content_type=?, caption=?, description=?, rank=? where id=?",
-                name, size, content_type, caption, description, rank, id)
+                "update attachments set caption=?, description=?, rank=? where id=?",
+                caption, description, rank, id)
             count = count + 1
             continue
 
