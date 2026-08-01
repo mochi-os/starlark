@@ -460,14 +460,17 @@ def attachment_data(id, frm=""):
     # the one path that materialises it as a Starlark value - in a process every
     # user on the host shares. Callers moving bytes rather than inspecting them
     # want attachment_copy or attachment_entry, which stream.
-    if int(row.get("size", 0)) > attachment_memory_maximum:
-        mochi.log.debug("attachment_data refusing %s: %d bytes exceeds the in-memory limit", id, row.get("size", 0))
-        return None
+    #
+    # The limit goes to the primitive rather than being checked against the row
+    # first. A row's size is a claim, and for a remote row it is the peer's
+    # claim: bounding on it meant a peer declaring nothing could have any amount
+    # of cache read into memory behind a limit that had already been satisfied.
+    # Only the file knows how big the file is.
     if row.get("entity"):
         if not attachment_pull(id, row, frm):
             return None
-        return mochi.cache.read(attachment_cache_name(id))
-    return mochi.file.read(attachment_filename(id, row["name"]))
+        return mochi.cache.read(attachment_cache_name(id), maximum=attachment_memory_maximum)
+    return mochi.file.read(attachment_filename(id, row["name"]), maximum=attachment_memory_maximum)
 
 # ---------------------------------------------------------------------------
 # Variants and cache naming
@@ -726,8 +729,16 @@ def attachment_pull(id, row, frm, variant=""):
 # because the next pull finds the entry present. That failure is silent at both
 # ends and leaves the bytes disagreeing with the metadata.
 def attachment_complete(written, declared, variant=""):
-    if variant or declared <= 0:
+    if variant:
         return True
+    # A row declaring nothing used to accept anything, which is the whole of a
+    # size check handed to the sender. Zero is a legitimate declaration - an
+    # empty file is a real attachment - so the answer is not to refuse it but to
+    # hold it to its word.
+    if declared == 0:
+        return written == 0
+    if declared < 0:
+        return False
     if written > declared * 2:
         return False
     return written >= declared
