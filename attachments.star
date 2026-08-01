@@ -167,7 +167,10 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
         name = meta["name"]
         id = mochi.uid()
         filename = attachment_filename(id, name)
-        size = a.upload(field, filename, index=i)
+        # Bounded against core's own figure rather than a copy of it. An
+        # attachment above what a transfer carries is kept whole by its owner
+        # and received as a prefix by every subscriber, silently.
+        size = a.upload(field, filename, index=i, maximum=mochi.file.maximum())
         content_type = meta.get("content_type", "")
         if not content_type:
             content_type = attachment_content_type(name)
@@ -193,6 +196,11 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
 # hand (a copy, a decoded payload). Pass id to preserve an existing identifier
 # (federation), entity for a remote-provenance row.
 def attachment_create(object, name, data, content_type="", caption="", description="", id="", entity=""):
+    # Same ceiling as the upload path: bytes already in hand are no different
+    # from bytes arriving over HTTP once they are an attachment.
+    if not entity and len(data) > mochi.file.maximum():
+        mochi.log.debug("attachment_create refusing %s: %d bytes exceeds the object limit", name, len(data))
+        return None
     if not id:
         id = mochi.uid()
     if not content_type:
@@ -227,6 +235,9 @@ def attachment_receive(object, name, stream, content_type="", id=""):
 # description="") stores an attachment from bytes at a specific 1-based rank,
 # shifting later attachments down. Returns the response dict.
 def attachment_insert(object, name, data, position, content_type="", caption="", description=""):
+    if len(data) > mochi.file.maximum():
+        mochi.log.debug("attachment_insert refusing %s: %d bytes exceeds the object limit", name, len(data))
+        return None
     id = mochi.uid()
     if not content_type:
         content_type = attachment_content_type(name)
@@ -386,6 +397,13 @@ def attachment_extract(archive, entry, object, name, content_type="", caption=""
 def attachment_data(id, frm=""):
     row = attachment_row(id)
     if not row:
+        return None
+    # An attachment may be as large as the uploader's whole quota, and this is
+    # the one path that materialises it as a Starlark value - in a process every
+    # user on the host shares. Callers moving bytes rather than inspecting them
+    # want attachment_copy or attachment_entry, which stream.
+    if int(row.get("size", 0)) > attachment_memory_maximum:
+        mochi.log.debug("attachment_data refusing %s: %d bytes exceeds the in-memory limit", id, row.get("size", 0))
         return None
     if row.get("entity"):
         if not attachment_pull(id, row, frm):
@@ -582,6 +600,10 @@ def attachment_number(value):
 # back (or a lagging host that upgrades) heals without intervention.
 attachment_backoff_seconds = 300
 
+# The largest attachment attachment_data will build as a Starlark value. Not a
+# storage limit - it bounds one function that has to hold what it returns.
+attachment_memory_maximum = 64 * 1024 * 1024
+
 def attachment_backoff_name(id, variant=""):
     if variant:
         return "backoff/" + id + "_" + variant
@@ -616,19 +638,33 @@ def attachment_pull(id, row, frm, variant=""):
         response = stream.read()
         if response and response.get("status") == "200":
             written = mochi.cache.write(name, stream)
-            # Size discipline (originals only; a variant's size is unknown
-            # ahead of time): refuse a response that grossly overshoots the
-            # declared size rather than filling the cache with garbage.
-            declared = int(row.get("size", 0))
-            if not variant and declared > 0 and written > declared * 2:
-                mochi.cache.delete(name)
-            else:
+            if attachment_complete(written, int(row.get("size", 0)), variant):
                 ok = True
+            else:
+                mochi.cache.delete(name)
     if not ok:
         # Record the failure time; attachment_backoff_seconds later the next
         # access retries. cache.age reads the write time without touching it.
         mochi.cache.write(attachment_backoff_name(id, variant), "1")
     return ok
+
+# attachment_complete judges a pulled body against the size the row declares.
+# Originals only: a variant is rendered by the source and its size is not known
+# ahead of time, so there is nothing to compare against.
+#
+# Both directions matter, and only one used to be checked. A response that
+# grossly overshoots is a peer filling our cache with garbage. One that falls
+# short is a truncated transfer - a dropped connection, a responder that died
+# mid-file, or a transfer limit below the size of the stored object - and
+# accepting it caches a prefix, serves it as if whole, and never retries,
+# because the next pull finds the entry present. That failure is silent at both
+# ends and leaves the bytes disagreeing with the metadata.
+def attachment_complete(written, declared, variant=""):
+    if variant or declared <= 0:
+        return True
+    if written > declared * 2:
+        return False
+    return written >= declared
 
 # attachment_respond(e, container, authorize, member=None) answers a byte-pull
 # request (an app event) with an attachment's bytes. Fixed sequence: resolve the
