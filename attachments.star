@@ -254,7 +254,17 @@ def attachment_receive(object, name, stream, content_type="", id=""):
     # succeeded - and a transfer of nothing is an empty file, which is a
     # legitimate thing to attach. Treating zero as failure deleted it and
     # reported nothing received, indistinguishable from a broken stream.
-    size = stream.read.file(filename)
+    #
+    # The same ceiling as the upload path: this is the P2P way for bytes to
+    # arrive, and it was the one entry bounded only by the sender's patience
+    # and the user's remaining quota. Core cuts one byte past the ceiling, so
+    # an oversized transfer is detectable here rather than truncated into a
+    # file that looks whole.
+    size = stream.read.file(filename, maximum=mochi.file.maximum())
+    if size > mochi.file.maximum():
+        mochi.log.debug("attachment_receive refusing %s: transfer exceeds the object limit", name)
+        mochi.file.delete(filename)
+        return None
     attachment_row_append(id, object, name, size, content_type, "", "", "", mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
@@ -709,8 +719,15 @@ def attachment_pull(id, row, frm, variant=""):
     if stream:
         response = stream.read()
         if response and response.get("status") == "200":
-            written = mochi.cache.write(name, stream)
-            if attachment_complete(written, int(row.get("size", 0)), variant):
+            # Bound the transfer to the size the row declares, so a peer
+            # answering a 1 KB pull cannot push gigabytes through the disk
+            # before the size check runs. A variant is rendered by the source
+            # and declares nothing, so it keeps the global cap. Core cuts one
+            # byte past the bound; an overrun therefore arrives as declared+1
+            # and fails the exactness check below.
+            declared = int(row.get("size", 0))
+            written = mochi.cache.write(name, stream, maximum=0 if variant else declared)
+            if attachment_complete(written, declared, variant):
                 ok = True
             else:
                 mochi.cache.delete(name)
@@ -742,9 +759,14 @@ def attachment_complete(written, declared, variant=""):
         return written == 0
     if declared < 0:
         return False
-    if written > declared * 2:
-        return False
-    return written >= declared
+    # Exact, in both directions. The source is streaming a file it owns whose
+    # size the row records; there is no honest way for the two to differ. Less
+    # is a truncated transfer, and more is a peer padding the body - which the
+    # transfer bound cuts to declared+1 exactly so it lands here as an
+    # overrun rather than as a silently truncated "complete" file. A slack of
+    # 2x used to be accepted here, with nothing that could legitimately
+    # produce it.
+    return written == declared
 
 # attachment_respond(e, container, authorize, member=None) answers a byte-pull
 # request (an app event) with an attachment's bytes. Fixed sequence: resolve the
