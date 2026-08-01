@@ -224,6 +224,20 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
 # (federation), entity for a remote-provenance row.
 def attachment_create(object, name, data, content_type="", caption="", description="", id="", entity=""):
     name = attachment_name(name)
+    # A caller-supplied id is a federated one, off a P2P event, and it is held
+    # to the same shape attachment_store holds it to: the id addresses the
+    # bytes on disk, so a malformed one either collides or poisons the whole
+    # filename. Never substituted - an id that changes here no longer matches
+    # the one every other host knows this attachment by.
+    if id and not attachment_identifier(id):
+        mochi.log.debug("attachment_create refusing %s: malformed identifier", name)
+        return None
+    # A remote-provenance row records where bytes live, and carries none; the
+    # entity+data combination silently discarded the bytes while recording
+    # their length, so it is refused rather than half-honoured.
+    if entity and data:
+        mochi.log.debug("attachment_create refusing %s: a remote row carries no bytes", name)
+        return None
     # Same ceiling as the upload path: bytes already in hand are no different
     # from bytes arriving over HTTP once they are an attachment.
     if not entity and len(data) > mochi.file.maximum():
@@ -245,6 +259,11 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
 # stream carried nothing. Pass id to preserve a federated identifier.
 def attachment_receive(object, name, stream, content_type="", id=""):
     name = attachment_name(name)
+    # Same rule as attachment_create: a federated id is validated, never
+    # substituted. wikis passes one straight off a P2P event.
+    if id and not attachment_identifier(id):
+        mochi.log.debug("attachment_receive refusing %s: malformed identifier", name)
+        return None
     if not id:
         id = mochi.uid()
     if not content_type:
@@ -573,6 +592,18 @@ def attachment_bound(row, container, member=None):
 # Skips a row whose id already belongs to a different object. Returns the count
 # stored.
 def attachment_store(rows, entity, object=None):
+    # The payload may not even be a sequence: every app passes
+    # e.content("attachments") straight in, and a peer sending a scalar would
+    # abort the DOMAIN handler mid-iteration - the comment or message lost,
+    # not just its attachments. The dict test below never caught this, because
+    # iteration itself is what raises. Both sequence shapes are legitimate: a
+    # local caller builds a list, and core decodes every wire array to a
+    # tuple - a list-only test here silently zeroed every P2P store.
+    if type(rows) not in ["list", "tuple"]:
+        return 0
+    if len(rows) > attachment_store_maximum:
+        mochi.log.debug("attachment_store truncating %d rows to %d", len(rows), attachment_store_maximum)
+        rows = rows[:attachment_store_maximum]
     count = 0
     for att in rows:
         if type(att) != "dict":
@@ -594,7 +625,14 @@ def attachment_store(rows, entity, object=None):
         content_type = attachment_text(att.get("content_type", ""), attachment_name_maximum)
         caption = attachment_text(att.get("caption", ""), attachment_text_maximum)
         description = attachment_text(att.get("description", ""), attachment_text_maximum)
+        # Ranks start at 1; zero is what attachment_number reduces everything
+        # unusable to, and it doubles here as the sentinel for "the row named
+        # no usable position" - absent, zero, negative, or past the integer
+        # the column holds. Such a row appends rather than landing below the
+        # floor every ordering query assumes.
         rank = attachment_number(att.get("rank", 0))
+        if rank > attachment_position_maximum:
+            rank = 0
 
         # An id we already hold under this object is an annotation update, and
         # the row's fields divide by what they mean rather than by what looks
@@ -613,17 +651,31 @@ def attachment_store(rows, entity, object=None):
         # is idempotent and a hostile one is inert.
         existing = attachment_row(id)
         if existing:
+            # A restatement may only annotate a row whose provenance matches
+            # the sender's. The conflict guard above holds the OBJECT, and
+            # identity immutability holds the bytes - but a row with entity ''
+            # is one WE created, and a peer quoting its id could still rewrite
+            # our caption, description and order. Which bytes these are was
+            # never the sender's to restate; that where-they-came-from decides
+            # whether they may restate at all closes the remainder.
+            if existing.get("entity", "") != entity:
+                continue
             mochi.db.execute(
                 "update attachments set caption=?, description=?, rank=? where id=?",
-                caption, description, rank, id)
+                caption, description,
+                rank if rank else existing.get("rank", 1), id)
             count = count + 1
             continue
 
+        # A row without a usable rank appends, choosing the position inside
+        # the insert for the same reason attachment_row_append does: two
+        # events landing rows on one object race on any read-then-write.
         mochi.db.execute(
-            "insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )",
+            """insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created )
+               values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce( nullif( ?, 0 ), ( select coalesce( max( rank ), 0 ) + 1 from attachments where object=? ) ), ? )""",
             id, target, entity, name, size, content_type,
             attachment_text(att.get("creator", ""), attachment_name_maximum),
-            caption, description, rank,
+            caption, description, rank, target,
             attachment_number(att.get("created", 0)) or mochi.time.now())
         count = count + 1
     return count
@@ -666,12 +718,29 @@ def attachment_text(value, maximum):
 # arrives as one.
 def attachment_number(value):
     kind = type(value)
-    if kind == "int":
-        return value if value > 0 else 0
     if kind == "float":
-        rounded = int(value)
-        return rounded if rounded > 0 else 0
-    return 0
+        value = int(value)
+    elif kind != "int":
+        return 0
+    if value < 0:
+        return 0
+    # Starlark integers are arbitrary precision and one past the database's
+    # cannot be bound as a parameter at all, so an absurd number would abort
+    # the statement rather than store large. This is the general bound - sizes
+    # legitimately exceed 32 bits - and ranks are clamped tighter where they
+    # are read.
+    if value > attachment_number_maximum:
+        return 0
+    return value
+
+# The largest integer the database binds.
+attachment_number_maximum = 9223372036854775807
+
+# The most rows one attachment_store call files. One event may claim any
+# number, each an insert; a bulk import stays far under this, and a peer
+# spending our disk row by row does not. The truncation is logged, never
+# silent.
+attachment_store_maximum = 1000
 
 # ---------------------------------------------------------------------------
 # Byte transfer (requester and responder)
@@ -783,8 +852,15 @@ def attachment_respond(e, container, authorize, member=None):
     if not authorize(sender, container):
         e.write({"status": "403"})
         return
+    # The id and variant are the peer's claims, and both feed functions that
+    # abort on a bad shape - the variant goes to mochi.image.variant, which
+    # raises for anything but its two kinds, so an unvalidated one let a peer
+    # kill our responder with a single word.
     id = e.content("id")
-    if not id:
+    if not attachment_identifier(id):
+        e.write({"status": "400"})
+        return
+    if e.content("variant", "") not in ["", "thumbnail", "preview"]:
         e.write({"status": "400"})
         return
     row = attachment_row(id)
