@@ -184,8 +184,14 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
     if a.user and a.user.identity:
         creator = a.user.identity.id
 
-    results = []
+    # Every file before any row. Bytes stream one file at a time, and a
+    # builtin error mid-upload aborts the handler with no cleanup - so with
+    # rows written per file, three of five uploads succeeding left three
+    # committed rows attached to an object the aborted handler never wrote.
+    # Files first makes the benign failure orphan files (swept later), and the
+    # single transaction below makes the rows all or nothing.
     files = a.files(field)
+    stored = []
     for i in range(len(files)):
         meta = files[i]
         # Canonical at the boundary: the browser sends whatever the user's own
@@ -193,29 +199,37 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
         # column, disk, responses, P2P rows - will carry.
         name = attachment_name(meta["name"])
         id = mochi.uid()
-        filename = attachment_filename(id, name)
         # Bounded against core's own figure rather than a copy of it. An
         # attachment above what a transfer carries is kept whole by its owner
         # and received as a prefix by every subscriber, silently.
-        size = a.upload(field, filename, index=i, maximum=mochi.file.maximum())
+        size = a.upload(field, attachment_filename(id, name), index=i, maximum=mochi.file.maximum())
         content_type = meta.get("content_type", "")
         if not content_type:
             content_type = attachment_content_type(name)
-        caption = captions[i] if i < len(captions) else ""
-        description = descriptions[i] if i < len(descriptions) else ""
-        created = mochi.time.now()
-        # File before row: a builtin error here aborts the handler with no
-        # cleanup, so the benign failure is an orphan file (swept later), never
-        # a row pointing at nothing.
-        attachment_row_append(id, object, name, size, content_type, creator, caption, description, created, "")
-        rank = attachment_row(id)["rank"]
-        results.append(attachment_map({
-            "id": id, "object": object, "entity": "", "name": name, "size": size,
-            "content_type": content_type, "creator": creator, "caption": caption,
-            "description": description, "rank": rank, "created": created,
-        }, prefix, ""))
-    if results:
-        attachment_sweep()
+        stored.append({
+            "id": id, "name": name, "size": size, "content_type": content_type,
+            "caption": captions[i] if i < len(captions) else "",
+            "description": descriptions[i] if i < len(descriptions) else "",
+        })
+
+    if not stored:
+        return []
+
+    # One transaction for the whole set. The rank subquery sees the rows this
+    # transaction already inserted, so the set lands in upload order, and no
+    # concurrent save can interleave its ranks into ours.
+    created = mochi.time.now()
+    handle = mochi.db.transaction()
+    for att in stored:
+        handle.execute(
+            """insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created )
+               values ( ?, ?, '', ?, ?, ?, ?, ?, ?, ( select coalesce( max( rank ), 0 ) + 1 from attachments where object=? ), ? )""",
+            att["id"], object, att["name"], att["size"], att["content_type"],
+            creator, att["caption"], att["description"], object, created)
+    handle.commit()
+
+    results = [attachment_map(attachment_row(att["id"]), prefix, "") for att in stored]
+    attachment_sweep()
     return results
 
 # attachment_create(object, name, data, content_type="", caption="",
@@ -296,6 +310,14 @@ def attachment_insert(object, name, data, position, content_type="", caption="",
         return None
     if not attachment_position(position):
         return None
+    # A position past the end is an append, not a hole: filed as given, the
+    # shift below matches nothing and the row lands beyond its neighbours,
+    # leaving a gap the next insert falls into. The count is read just before
+    # the transaction; a concurrent insert can age it by one, which costs a
+    # one-off gap where the unclamped path cost an arbitrary one.
+    count = mochi.db.row("select count(*) as total from attachments where object=?", object)["total"]
+    if position > count + 1:
+        position = count + 1
     id = mochi.uid()
     if not content_type:
         content_type = attachment_content_type(name)
@@ -336,8 +358,13 @@ def attachment_delete(id):
     row = attachment_row(id)
     if not row:
         return False
-    mochi.db.execute("delete from attachments where id=?", id)
-    mochi.db.execute("update attachments set rank = rank - 1 where object=? and rank > ?", row["object"], row["rank"])
+    # Remove and shift as one unit, for the same reason insert and move do:
+    # interleaved with either, a bare pair leaves the order decided by
+    # whichever statement landed last.
+    handle = mochi.db.transaction()
+    handle.execute("delete from attachments where id=?", id)
+    handle.execute("update attachments set rank = rank - 1 where object=? and rank > ?", row["object"], row["rank"])
+    handle.commit()
     if not row.get("entity"):
         mochi.file.delete(attachment_filename(id, row["name"]))
     attachment_forget(row)
@@ -357,6 +384,12 @@ def attachment_move(id, position):
     row = attachment_row(id)
     if not row:
         return None
+    # A move past the end means last. A move does not grow the list, so the
+    # ceiling is the count itself, and the row being moved guarantees it is at
+    # least one.
+    count = mochi.db.row("select count(*) as total from attachments where object=?", row["object"])["total"]
+    if position > count:
+        position = count
     old = row["rank"]
     new = position
     if old != new:
@@ -373,10 +406,11 @@ def attachment_move(id, position):
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_position reports whether a caller-supplied position is a usable
-# rank. Ranks start at 1, which core required and this did not: a zero or
-# negative one puts a row below the floor every other query assumes, and one far
-# past the end leaves the shift matching nothing while the row lands beyond its
-# neighbours, so the list has a hole the next insert falls into.
+# rank SHAPE: an integer from 1, which core required and this did not - a zero
+# or negative one puts a row below the floor every other query assumes. The
+# other hazard, a position far past the end, is not this function's to judge
+# because it depends on the object: insert and move clamp against their own
+# list, to append and to last.
 def attachment_position(position):
     if type(position) != "int" or position < 1 or position > attachment_position_maximum:
         mochi.log.debug("attachment position %s is not a rank", str(position))
@@ -419,7 +453,13 @@ def attachment_copy(id, object, frm="", caption="", description=""):
             return None
         size = mochi.cache.copy(attachment_cache_name(id), destination)
     else:
-        size = mochi.file.copy(attachment_filename(id, name), destination)
+        # Same guard as attachment_data: the copy primitive raises on a
+        # missing source, and a row whose file is gone should degrade, not
+        # abort.
+        source = attachment_filename(id, name)
+        if not mochi.file.exists(source):
+            return None
+        size = mochi.file.copy(source, destination)
     if size == None:
         return None
 
@@ -499,7 +539,15 @@ def attachment_data(id, frm=""):
         if not attachment_pull(id, row, frm):
             return None
         return mochi.cache.read(attachment_cache_name(id), maximum=attachment_memory_maximum)
-    return mochi.file.read(attachment_filename(id, row["name"]), maximum=attachment_memory_maximum)
+    # The file primitives raise on a missing source, which Starlark cannot
+    # catch, so the documented "or None" held for the cache path and not this
+    # one: an orphaned row turned a graceful degrade into an abort. The guard
+    # has a race window, but its loser merely aborts as every reader did
+    # before; os.Root owns safety.
+    filename = attachment_filename(id, row["name"])
+    if not mochi.file.exists(filename):
+        return None
+    return mochi.file.read(filename, maximum=attachment_memory_maximum)
 
 # ---------------------------------------------------------------------------
 # Variants and cache naming
