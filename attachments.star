@@ -52,8 +52,15 @@ def attachment_schema_create():
 # ---------------------------------------------------------------------------
 
 # The longest filename most filesystems accept for one path component. The id
-# and its separator spend 33 bytes of it, so this is the room a name has.
+# and its separator spend 33 bytes of it, and attachment_variant_room reserves
+# the rest of what a name may not use.
 attachment_component_maximum = 255
+
+# Room for the longest variant infix, "_thumbnail". A variant's cache entry is
+# the file name with the kind spliced in, so a name budgeted to the component
+# limit exactly produced variant names past it - rendering a long-named
+# image's thumbnail aborted the serve, and dropping one aborted the delete.
+attachment_variant_room = len("_thumbnail")
 
 # The storage filename for an attachment: the id, a separator, and the cleaned
 # name - readable on disk for debugging, unique and sweep-parseable through the
@@ -64,7 +71,7 @@ attachment_component_maximum = 255
 # anyone naming a file in their own language - failed after the bytes were
 # already streamed to disk.
 def attachment_filename(id, name):
-    return id + "_" + mochi.file.clean(name, attachment_component_maximum - len(id) - 1)
+    return id + "_" + mochi.file.clean(name, attachment_component_maximum - len(id) - 1 - attachment_variant_room)
 
 # attachment_name is the canonical form of a client-supplied name, applied once
 # where a name enters the library - upload, create, receive, store - so the
@@ -74,7 +81,7 @@ def attachment_filename(id, name):
 def attachment_name(name):
     if type(name) != "string":
         name = str(name)
-    return mochi.file.clean(name, attachment_component_maximum - 33)
+    return mochi.file.clean(name, attachment_component_maximum - 33 - attachment_variant_room)
 
 def attachment_is_image(name):
     lower = name.lower()
@@ -561,15 +568,34 @@ def attachment_cache_name(id, variant=""):
         return "remote/" + id + "_" + variant
     return "remote/" + id
 
-# attachment_forget drops an attachment's cache entries. Image variants of an
-# OWN attachment are left to expire by eviction: mochi.image.variant owns their
-# naming, ids are never reused, so a stale variant is harmless and regenerates.
-# A remote copy's entries share the id, so they are dropped explicitly.
+# attachment_forget drops an attachment's cache entries: a remote copy's
+# original and variants, and an own image's rendered variants.
 def attachment_forget(row):
     if row.get("entity"):
         mochi.cache.delete(attachment_cache_name(row["id"], ""))
         mochi.cache.delete(attachment_cache_name(row["id"], "thumbnail"))
         mochi.cache.delete(attachment_cache_name(row["id"], "preview"))
+        return
+    # An own image's rendered variants live in cache under a name derived from
+    # the file's - deterministic, so a deleted private image's thumbnail is
+    # dropped now rather than lingering until eviction. The derivation mirrors
+    # core's variant naming; the test suite holds the two equal against what
+    # mochi.image.variant actually returns, so a rename there fails loudly
+    # instead of silently orphaning variants again.
+    if attachment_is_image(row["name"]):
+        filename = attachment_filename(row["id"], row["name"])
+        mochi.cache.delete("variants/" + attachment_variant_name(filename, "thumbnail"))
+        mochi.cache.delete("variants/" + attachment_variant_name(filename, "preview"))
+
+# The cache entry stem core's variant renderer uses: the file name with the
+# kind spliced in ahead of the extension.
+def attachment_variant_name(filename, kind):
+    extension = ""
+    index = filename.rfind(".")
+    if index >= 0:
+        extension = filename[index:]
+        filename = filename[:index]
+    return filename + "_" + kind + extension
 
 # ---------------------------------------------------------------------------
 # HTTP serving (the action is the gate)
@@ -599,14 +625,22 @@ def attachment_serve(a, id, container, authorize, variant="", member=None):
     # variant that cannot be produced falls back to the original. The stream's
     # "from" is the requesting user's identity when authenticated (which the
     # source authorizes), else the container's route entity for a public pull.
+    # The served content type derives from the attachment's NAME on every
+    # branch, never from the row's content_type column. For a remote row that
+    # column is the peer's claim, and while the safe-serve policy confines the
+    # damage, it still let a peer choose inline PDF rendering for arbitrary
+    # bytes. The local file branch always derived from the name; the cache
+    # branches pass the same derivation explicitly, because a remote cache
+    # entry is named by id alone and carries no extension for core to read.
+    kind = mochi.file.type(row["name"])
     if row.get("entity"):
         frm = a.user.identity.id if (a.user and a.user.identity) else container
         want = variant if (variant and attachment_is_image(row["name"])) else ""
         if want and attachment_pull(id, row, frm, want):
-            a.write.cache(attachment_cache_name(id, want), content_type=row.get("content_type", ""))
+            a.write.cache(attachment_cache_name(id, want), content_type=kind)
             return
         if attachment_pull(id, row, frm, ""):
-            a.write.cache(attachment_cache_name(id, ""), content_type=row.get("content_type", ""))
+            a.write.cache(attachment_cache_name(id, ""), content_type=kind)
             return
         a.error.label(404, "attachment.errors.not_found")
         return
@@ -615,7 +649,7 @@ def attachment_serve(a, id, container, authorize, variant="", member=None):
     # mochi.image.variant renders into cache on demand.
     if variant and attachment_is_image(row["name"]):
         name = mochi.image.variant(attachment_filename(id, row["name"]), variant)
-        if name and a.write.cache(name, content_type=row.get("content_type", "")):
+        if name and a.write.cache(name, content_type=kind):
             return
     a.write.file(attachment_filename(id, row["name"]))
 
@@ -959,6 +993,11 @@ def attachment_sweep(age=3600):
     files = mochi.file.list("")
     if not files:
         return
+    # One query for the whole pass. Testing each candidate with its own
+    # attachment_exists made every upload pay a query per stored file - for a
+    # user with thousands of attachments in one app, thousands of round trips
+    # per save, spent looking for orphans that almost never exist.
+    held = {row["id"]: True for row in mochi.db.rows("select id from attachments")}
     for entry in files:
         fname = entry.get("name", "") if type(entry) == "dict" else entry
         under = fname.find("_")
@@ -969,7 +1008,7 @@ def attachment_sweep(age=3600):
         # hyphens removed); anything else is some other app file, left alone.
         if len(id) != 32 or not attachment_hex(id):
             continue
-        if attachment_exists(id):
+        if id in held:
             continue
         # A disk name the validator refuses was written under an older rule;
         # mochi.file.age would abort the handler on it, and one such file must
