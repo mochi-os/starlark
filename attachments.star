@@ -601,17 +601,19 @@ def attachment_variant_name(filename, kind):
 # HTTP serving (the action is the gate)
 # ---------------------------------------------------------------------------
 
-# attachment_serve(a, id, container, authorize, variant="", member=None) serves
-# an attachment's bytes (or an image variant) to the HTTP response. The caller
-# MUST have resolved container and pass authorize(container) -> bool; the library
-# applies no access check of its own. The attachment is bound to container -
-# directly, or through member(object) -> bool for attachments on the container's
-# children (a wiki's comments) - so one container's route cannot fetch another's
-# attachment by id. Writes an error label on refusal or absence.
-def attachment_serve(a, id, container, authorize, variant="", member=None):
-    if not authorize(container):
-        a.error.label(403, "attachment.errors.denied")
-        return
+# attachment_serve(a, id, container, variant="", member=None) serves an
+# attachment's bytes (or an image variant) to the HTTP response. THE CALLING
+# ACTION IS THE GATE: it must authorize the requester against container before
+# calling, and check-attachment-access.py enforces that a gate is visible in
+# the enclosing function. An authorize callback used to be a required argument
+# here, meant to make the ungated shape inexpressible - five of six apps
+# passed lambda: True because they had already gated, which reduced the
+# parameter to ceremony the grep gate could not tell from substance. The
+# binding stays: the attachment must belong to container - directly, or
+# through member(object) -> bool for attachments on the container's children
+# (a wiki's comments) - so one container's route cannot fetch another's
+# attachment by id. Writes an error label on absence.
+def attachment_serve(a, id, container, variant="", member=None):
     row = attachment_row(id)
     if not row:
         a.error.label(404, "attachment.errors.not_found")
@@ -862,9 +864,13 @@ def attachment_pull(id, row, frm, variant=""):
     # identity (which the responder authorizes) for an authenticated pull, or
     # the container's route entity for an anonymous public one. `to` is the
     # source from app state (the row's provenance), never a field a response
-    # claims.
+    # claims. The frame routes by SERVICE: the app's declared one, which for
+    # most apps happens to equal the URL path prefix this used to send - a
+    # coincidence that breaks for any app shaped like comptroller (paths
+    # ["comptroller"], services ["market"]).
+    services = mochi.app.services()
     stream = mochi.stream(
-        {"from": frm, "to": entity, "service": mochi.app.url(), "event": "attachment/fetch"},
+        {"from": frm, "to": entity, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
         {"id": id, "object": row["object"], "variant": variant})
     ok = False
     if stream:
