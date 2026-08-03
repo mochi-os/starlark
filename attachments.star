@@ -1039,6 +1039,19 @@ def attachment_hex(text):
 # gone (a dormant user migrating after the cleanup release), it aborts without
 # advancing the version so the step retries when an export appears.
 def attachment_migrate():
+    # The bridge may be ABSENT, not just answering None: a core past the
+    # cleanup release no longer defines the API at all, and calling an
+    # undefined attribute raises - which a migration step pays for with its
+    # version number while its table creation rolls back. That exact shape is
+    # how servers that installed the first library apps ahead of their core
+    # update were left at full schema with no attachments table: the un-gated
+    # first versions ran on cores without mochi.attachment.export, the raise
+    # consumed both step numbers in one pass, and every attachment query since
+    # answered "no such table". Aborting instead holds the version, so the
+    # step retries when the bridge is there.
+    if not hasattr(mochi, "attachment") or not hasattr(mochi.attachment, "export"):
+        mochi.db.abort("attachment bridge unavailable")
+        return
     rows = mochi.attachment.export()
     if rows == None:
         mochi.db.abort("attachment bridge unavailable")
