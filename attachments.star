@@ -296,10 +296,12 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
 
 # attachment_receive(object, name, stream, content_type="", id="") stores an
 # attachment whose bytes arrive on an open stream (a source pulling an upload
-# from a replica). Streams straight to file storage - no whole-file buffering -
-# and records an own row (entity ""). Returns the response dict, or None if the
-# stream carried nothing. Pass id to preserve a federated identifier.
-def attachment_receive(object, name, stream, content_type="", id=""):
+# from a replica, or a subscriber pushing one). Streams straight to file
+# storage - no whole-file buffering - and records an own row (entity "").
+# Returns the response dict, or None if the stream carried nothing. Pass id to
+# preserve a federated identifier; creator, caption and description carry the
+# uploader's annotations onto the row.
+def attachment_receive(object, name, stream, content_type="", id="", creator="", caption="", description=""):
     name = attachment_name(name)
     # Same rule as attachment_create: a federated id is validated, never
     # substituted. wikis passes one straight off a P2P event.
@@ -326,7 +328,7 @@ def attachment_receive(object, name, stream, content_type="", id=""):
         mochi.log.debug("attachment_receive refusing %s: transfer exceeds the object limit", name)
         mochi.file.delete(filename)
         return None
-    attachment_row_append(id, object, name, size, content_type, "", "", "", mochi.time.now(), "")
+    attachment_row_append(id, object, name, size, content_type, creator, caption, description, mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_insert(object, name, data, position, content_type="", caption="",
@@ -629,7 +631,7 @@ def attachment_variant_name(filename, kind):
 # through member(object) -> bool for attachments on the container's children
 # (a wiki's comments) - so one container's route cannot fetch another's
 # attachment by id. Writes an error label on absence.
-def attachment_serve(a, id, container, variant="", member=None):
+def attachment_serve(a, id, container, variant="", member=None, adopt=False):
     row = attachment_row(id)
     if not row:
         a.error.label(404, "attachment.errors.not_found")
@@ -653,15 +655,26 @@ def attachment_serve(a, id, container, variant="", member=None):
     kind = mochi.file.type(row["name"])
     if row.get("entity"):
         requester = a.user.identity.id if (a.user and a.user.identity) else container
-        want = variant if (variant and attachment_is_image(row["name"])) else ""
-        if want and attachment_pull(id, row, requester, want):
-            a.write.cache(attachment_cache_name(id, want), content_type=kind)
+        # The container's canonical holder passes adopt=True: a remote row in
+        # its store is a legacy of the uploader-keeps-the-bytes scheme, healed
+        # here by taking the bytes in on first serve. Subscribers keep pulling
+        # to cache - adopting there would replicate every attachment to every
+        # subscriber's permanent storage. The adopt pull opens as the container
+        # entity, not the viewer: the uploader's responder recognises the
+        # container it holds the upload for, while a viewer's identity means
+        # nothing on that host.
+        if adopt and attachment_adopt(id, container):
+            row = attachment_row(id)
+        else:
+            want = variant if (variant and attachment_is_image(row["name"])) else ""
+            if want and attachment_pull(id, row, requester, want):
+                a.write.cache(attachment_cache_name(id, want), content_type=kind)
+                return
+            if attachment_pull(id, row, requester, ""):
+                a.write.cache(attachment_cache_name(id, ""), content_type=kind)
+                return
+            a.error.label(404, "attachment.errors.not_found")
             return
-        if attachment_pull(id, row, requester, ""):
-            a.write.cache(attachment_cache_name(id, ""), content_type=kind)
-            return
-        a.error.label(404, "attachment.errors.not_found")
-        return
 
     # Own row: serve the original from file storage, or an image variant which
     # mochi.image.variant renders into cache on demand.
@@ -854,6 +867,7 @@ def attachment_pull(id, row, requester, variant=""):
 
     entity = row.get("entity", "")
     if not entity or not requester:
+        mochi.log.debug("attachment_pull %s: no entity (%s) or requester (%s)", id, entity, requester)
         return False
     # `requester` is the local entity opening the stream - the requesting user's
     # identity (which the responder authorizes) for an authenticated pull, or
@@ -868,8 +882,12 @@ def attachment_pull(id, row, requester, variant=""):
         {"from": requester, "to": entity, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
         {"id": id, "object": row["object"], "variant": variant})
     ok = False
+    if not stream:
+        mochi.log.debug("attachment_pull %s: stream open to %s failed", id, entity)
     if stream:
         response = stream.read()
+        if not response or response.get("status") != "200":
+            mochi.log.debug("attachment_pull %s: response %s", id, str(response))
         if response and response.get("status") == "200":
             # Bound the transfer to the size the row declares, so a peer
             # answering a 1 KB pull cannot push gigabytes through the disk
@@ -968,6 +986,141 @@ def attachment_respond(e, container, authorize, member=None):
             return
     e.write({"status": "200"})
     e.write.file(attachment_filename(id, row["name"]))
+
+# attachment_push(container, object, stored, requester) streams locally saved
+# attachments to container's owner, one attachment/push stream per file:
+# metadata in the opening frame, the bytes, then the owner's ack. The owner is
+# canonical - it stores the bytes as its own and fans the metadata out - so a
+# row only ever exists downstream of the bytes it describes. Returns True when
+# every attachment is acknowledged; the first failure stops the batch and the
+# caller unwinds its local saves, because a "successful" upload nobody else can
+# see is the failure this scheme exists to remove. The uploader's own rows stay
+# entity "" with the file on disk: it legitimately holds the bytes, and the
+# owner's later fan-out restatement is inert against them.
+def attachment_push(container, object, stored, requester):
+    if not requester:
+        return False
+    # Route by the app's declared service, not its URL prefix - the same
+    # comptroller-shaped distinction attachment_pull carries.
+    services = mochi.app.services()
+    service = services[0] if services else mochi.app.url()
+    for attachment in stored:
+        id = attachment["id"]
+        stream = mochi.stream(
+            {"from": requester, "to": container, "service": service, "event": "attachment/push"},
+            {"object": object, "id": id, "name": attachment["name"],
+             "size": attachment.get("size", 0),
+             "content_type": attachment.get("type") or attachment.get("content_type", ""),
+             "caption": attachment.get("caption", ""),
+             "description": attachment.get("description", "")})
+        if not stream:
+            return False
+        # Two phases, strictly alternating: the owner judges the metadata and
+        # answers before any byte moves, and only then do the bytes flow. A
+        # single-phase push deadlocked against a refusal - the responder
+        # blocked writing its status into a pipe nobody was reading while this
+        # side blocked writing bytes into the same, and both sat out their
+        # timeouts. With the go-ahead read here, whichever side is writing,
+        # the other is reading. A 200 at the go-ahead is the retry case: the
+        # owner already holds this attachment, and the bytes stay home.
+        response = stream.read()
+        status = response.get("status") if response else ""
+        if status == "200":
+            continue
+        if status != "100":
+            return False
+        # write.file closes the write side when the bytes are sent, so the ack
+        # read below is unambiguous: the owner answers after its row exists.
+        written = stream.write.file(attachment_filename(id, attachment["name"]))
+        if written == None:
+            return False
+        response = stream.read()
+        if not response or response.get("status") != "200":
+            return False
+    return True
+
+# attachment_push_receive(e, object, creator="") answers one attachment/push
+# stream: validate the metadata claims, stream the bytes to file storage, write
+# the own row, ack. AUTHORIZATION IS THE CALLING HANDLER'S: it verified the
+# signed sender holds write access on the container and that object belongs to
+# it before calling, exactly as the HTTP upload action gates its own request.
+# Returns the response dict, or None with the refusal already written.
+def attachment_push_receive(e, object, creator=""):
+    id = e.content("id")
+    if not attachment_identifier(id):
+        e.write({"status": "400"})
+        return None
+    # An id bound to another object must not be repointed (attachment_store's
+    # rule); one already bound to THIS object is a retry of a push whose ack
+    # was lost, and answering 200 without touching anything makes the retry
+    # safe rather than a duplicate.
+    if attachment_conflict(id, object):
+        e.write({"status": "409"})
+        return None
+    if attachment_exists(id):
+        e.write({"status": "200"})
+        return attachment_map(attachment_row(id), mochi.app.url(), "")
+    name = attachment_name(attachment_text(e.content("name", ""), attachment_name_maximum))
+    if not name:
+        e.write({"status": "400"})
+        return None
+    content_type = attachment_text(e.content("content_type", ""), attachment_name_maximum)
+    caption = attachment_text(e.content("caption", ""), attachment_text_maximum)
+    description = attachment_text(e.content("description", ""), attachment_text_maximum)
+    # Go-ahead: the metadata passed judgement, so invite the bytes. The pusher
+    # reads this before writing them (see attachment_push on why the phases
+    # must alternate).
+    e.write({"status": "100"})
+    attachment = attachment_receive(object, name, e, content_type, id,
+                                    creator=creator, caption=caption, description=description)
+    if not attachment:
+        e.write({"status": "400"})
+        return None
+    e.write({"status": "200"})
+    return attachment
+
+# attachment_accept(rows, sender, object, requester="") is the owner-side
+# counterpart of a metadata-carrying content submission: store the rows as
+# attachment_store does, then immediately take each one's bytes in from the
+# sender, who is by definition just-online. A pull that fails leaves that row
+# remote-provenance, and the canonical holder's adopt-on-serve heals it later -
+# the submission itself is never rejected over its attachments. requester is
+# the identity the pull streams open as; the container's own entity is the
+# natural one, since the sender-side responder recognises the container it
+# holds the upload for. Returns the count stored.
+def attachment_accept(rows, sender, object, requester=""):
+    count = attachment_store(rows, sender, object)
+    if type(rows) in ["list", "tuple"]:
+        for attachment in rows[:attachment_store_maximum]:
+            if type(attachment) == "dict" and attachment_identifier(attachment.get("id")):
+                attachment_adopt(attachment["id"], requester)
+    return count
+
+# attachment_adopt(id, requester="") turns a remote-provenance row into an own
+# one: pull the original into cache, copy it into file storage under the name
+# every other host already knows, and flip the row. The size is re-recorded
+# from the copy - the row's figure was the peer's claim, and the completeness
+# check in attachment_pull held the transfer to it, so the two agree or the
+# pull already failed. Idempotent: an own row is already adopted. This is how
+# the canonical holder of a container heals rows minted under the old
+# uploader-keeps-the-bytes scheme without a migration pass - the first serve
+# adopts, every later one reads a local file.
+def attachment_adopt(id, requester=""):
+    row = attachment_row(id)
+    if not row:
+        return False
+    if not row.get("entity"):
+        return True
+    if not attachment_pull(id, row, requester):
+        return False
+    size = mochi.cache.copy(attachment_cache_name(id), attachment_filename(id, row["name"]))
+    if size == None:
+        return False
+    mochi.db.execute("update attachments set entity='', size=? where id=?", size, id)
+    # The remote-name cache entries are orphans once the row is ours; variants
+    # re-render from the file under their own naming.
+    attachment_forget(row)
+    return True
 
 # ---------------------------------------------------------------------------
 # Orphan sweep
