@@ -1185,29 +1185,42 @@ def attachment_hex(text):
 # Migration (transition bridge)
 # ---------------------------------------------------------------------------
 
-# attachment_migrate() copies attachment rows out of core's managed store into
-# this app's own table, once, from a database_upgrade step. Ids are preserved
+# Where core materialised each user's attachment rows before it dropped its own
+# store: one JSON list per (user, app), at the root of the app's file storage,
+# written only where rows existed. The name is not uid-shaped, so the orphan
+# sweep never touches it. Each entry carries the columns an attachment row
+# holds plus "file", the stored filename of an own row ("" for a remote one).
+attachment_export_file = "attachments.json"
+
+# attachment_export() returns the rows core's store held for this user and app:
+# from the bridge while a core still has one, else from the file its cleanup
+# wrote, else nothing - a core without the bridge exported every store that had
+# rows before it served a request, so no file means no rows. The one hold is an
+# export that exists and cannot be read: that is a damaged file, not an empty
+# store, so the migration aborts without advancing and an operator sees it.
+def attachment_export():
+    if hasattr(mochi, "attachment") and hasattr(mochi.attachment, "export"):
+        rows = mochi.attachment.export()
+        if rows == None:
+            mochi.db.abort("attachment bridge unavailable")
+            return None
+        return rows
+    if not mochi.file.exists(attachment_export_file):
+        return []
+    rows = json.decode(str(mochi.file.read(attachment_export_file) or ""), None)
+    if type(rows) != "list":
+        mochi.db.abort("attachment export unreadable")
+        return None
+    return rows
+
+# attachment_migrate() copies attachment rows out of core's store into this
+# app's own table, once, from a database_upgrade step. Ids are preserved
 # verbatim (URLs and remote references depend on them). Own rows (entity "")
-# keep their files in place; remote rows keep pull-on-demand. If the bridge is
-# gone (a dormant user migrating after the cleanup release), it aborts without
-# advancing the version so the step retries when an export appears.
+# keep their files in place; remote rows keep pull-on-demand. A core without
+# the bridge and without an export for this store has nothing to copy.
 def attachment_migrate():
-    # The bridge may be ABSENT, not just answering None: a core past the
-    # cleanup release no longer defines the API at all, and calling an
-    # undefined attribute raises - which a migration step pays for with its
-    # version number while its table creation rolls back. That exact shape is
-    # how servers that installed the first library apps ahead of their core
-    # update were left at full schema with no attachments table: the un-gated
-    # first versions ran on cores without mochi.attachment.export, the raise
-    # consumed both step numbers in one pass, and every attachment query since
-    # answered "no such table". Aborting instead holds the version, so the
-    # step retries when the bridge is there.
-    if not hasattr(mochi, "attachment") or not hasattr(mochi.attachment, "export"):
-        mochi.db.abort("attachment bridge unavailable")
-        return
-    rows = mochi.attachment.export()
+    rows = attachment_export()
     if rows == None:
-        mochi.db.abort("attachment bridge unavailable")
         return
     for attachment in rows:
         id = attachment.get("id")
