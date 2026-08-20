@@ -670,10 +670,22 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
             if want and attachment_pull(id, row, requester, want):
                 a.write.cache(attachment_cache_name(id, want), content_type=kind)
                 return
-            if attachment_pull(id, row, requester, ""):
+            pulled = attachment_pull(id, row, requester, "")
+            if pulled:
                 a.write.cache(attachment_cache_name(id, ""), content_type=kind)
                 return
-            a.error.label(404, "attachment.errors.not_found")
+            # Two different truths, told apart by the pull's failure class. A
+            # source that answered negatively means the bytes are gone - 404,
+            # as for a row that does not exist. One that could not be reached
+            # says nothing about the bytes: the host may be offline for an
+            # hour or forever, and claiming "not found" while it is merely
+            # away is a lie the user cannot see through. 503 with its own
+            # label, so the client can show "unavailable" and a retry later
+            # may simply work.
+            if pulled == None:
+                a.error.label(503, "attachment.errors.unavailable")
+            else:
+                a.error.label(404, "attachment.errors.not_found")
             return
 
     # Own row: serve the original from file storage, or an image variant which
@@ -855,15 +867,28 @@ def attachment_backoff_name(id, variant=""):
 # attachment_pull(id, row, variant="") ensures a remote attachment's bytes (the
 # original, or an image variant the source renders) are in the cache, requesting
 # them from the container's source when absent. Returns True if present
-# afterwards. Applies time-based backoff on failure. The source is the row's
-# provenance entity (app state), never a field a response claims.
+# afterwards; on failure the falsy value carries its class, so a serve can
+# answer honestly: None when the source could not be reached (the stream would
+# not open, or the transfer broke off - retried after backoff), False when the
+# source answered and the bytes are not to be had, or the row cannot be pulled
+# at all. Callers gating on truthiness are unaffected. Applies time-based
+# backoff on failure, and the backoff marker records the class, so the answer
+# keeps its meaning between retries. The source is the row's provenance entity
+# (app state), never a field a response claims.
 def attachment_pull(id, row, requester, variant=""):
     name = attachment_cache_name(id, variant)
     if mochi.cache.path(name):
         return True
-    age = mochi.cache.age(attachment_backoff_name(id, variant))
+    marker = attachment_backoff_name(id, variant)
+    age = mochi.cache.age(marker)
     if age != None and age < attachment_backoff_seconds:
-        return False  # still within the backoff window; not a tombstone
+        # Still within the backoff window; not a tombstone. Answer with the
+        # class of the failure being backed off ("unreachable" means
+        # transport; anything else, including a marker from before classes
+        # existed, means the source answered).
+        if str(mochi.cache.read(marker) or "") == "unreachable":
+            return None
+        return False
 
     entity = row.get("entity", "")
     if not entity or not requester:
@@ -881,14 +906,20 @@ def attachment_pull(id, row, requester, variant=""):
     stream = mochi.stream(
         {"from": requester, "to": entity, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
         {"id": id, "object": row["object"], "variant": variant})
-    ok = False
+    outcome = False
     if not stream:
         mochi.log.debug("attachment_pull %s: stream open to %s failed", id, entity)
+        outcome = None
     if stream:
         response = stream.read()
-        if not response or response.get("status") != "200":
+        if not response:
+            # The stream opened and then died before an answer arrived - the
+            # transport failed, not the source's verdict.
+            mochi.log.debug("attachment_pull %s: no response", id)
+            outcome = None
+        elif response.get("status") != "200":
             mochi.log.debug("attachment_pull %s: response %s", id, str(response))
-        if response and response.get("status") == "200":
+        else:
             # Bound the transfer to the size the row declares, so a peer
             # answering a 1 KB pull cannot push gigabytes through the disk
             # before the size check runs. A variant is rendered by the source
@@ -898,14 +929,19 @@ def attachment_pull(id, row, requester, variant=""):
             declared = int(row.get("size", 0))
             written = mochi.cache.write(name, stream, maximum=0 if variant else declared)
             if attachment_complete(written, declared, variant):
-                ok = True
+                outcome = True
             else:
+                # A truncated or padded transfer: the source holds the bytes
+                # and the wire failed to carry them, so the next retry may
+                # succeed - the transport class, not a verdict.
                 mochi.cache.delete(name)
-    if not ok:
-        # Record the failure time; attachment_backoff_seconds later the next
-        # access retries. cache.age reads the write time without touching it.
-        mochi.cache.write(attachment_backoff_name(id, variant), "1")
-    return ok
+                outcome = None
+    if outcome != True:
+        # Record the failure time and class; attachment_backoff_seconds later
+        # the next access retries. cache.age reads the write time without
+        # touching it.
+        mochi.cache.write(marker, "unreachable" if outcome == None else "refused")
+    return outcome
 
 # attachment_complete judges a pulled body against the size the row declares.
 # Originals only: a variant is rendered by the source and its size is not known
