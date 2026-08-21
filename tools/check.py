@@ -4,16 +4,10 @@
 # This file is part of Mochi, licensed under the GNU AGPL v3 with the
 # Mochi Application Interface Exception - see license.txt and license-exception.md.
 
-"""The checks this repo can run on its own. The library's behavioural suite
-needs a running server and lives with the platform (apps/test drives every
-function, and claude/scripts/p2p-test.py drives the P2P paths end to end);
-what a standalone checkout can still catch at PR time is the
-bracket-and-indent class of break, a name defined twice, and a module-level
-name used before the line that defines it - Starlark resolves at call time,
-so that last one is legal at runtime and still makes the file read backwards.
-
-Starlark is syntactically a Python subset and these files stay inside the
-overlap, so Python's own parser is the syntax gate."""
+"""The checks a standalone checkout can run: syntax, a name defined twice, and a
+module-level name used before its definition - Starlark resolves at call time, so
+that one is legal at runtime. The behavioural suite needs a running server and
+lives with the platform (apps/test, claude/scripts/p2p-test.py)."""
 import ast
 import sys
 from pathlib import Path
