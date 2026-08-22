@@ -595,7 +595,15 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
         name = mochi.image.variant(attachment_filename(id, row["name"]), variant)
         if name and a.write.cache(name, content_type=kind):
             return
-    a.write.file(attachment_filename(id, row["name"]))
+    # a.write.file reads the route entity OWNER's storage, while the row above
+    # came from mochi.db and the variant above from mochi.image.variant, both of
+    # which read the CALLER's. Those differ whenever a non-owner serves an
+    # attachment they uploaded themselves, whose bytes are in the uploader's
+    # storage. The owner usually holds a copy too, from the push or the fan-out,
+    # so ask for the caller's own storage only once the caller is shown to hold
+    # the file, leaving the owner's copy as the fallback.
+    file = attachment_filename(id, row["name"])
+    a.write.file(file, storage=(a.user != None and mochi.file.age(file) != None))
 
 # attachment_bound reports whether an attachment belongs to container, either
 # directly (object == container) or via the caller's member() predicate (a
