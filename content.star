@@ -12,8 +12,6 @@
 # Every definition is prefixed content_; each app vendors this file as a symlink
 # into apps/<app>/lib/, listed first in app.json "execute".
 
-content_library_version = "1.0"
-
 # content_text(e, key, fallback) -> string: a text field from an event payload.
 # Non-strings are dropped rather than coerced - str() would store a peer's list
 # as "[1, 2, 3]" in somebody's page title.
@@ -57,6 +55,9 @@ def content_decode(raw, fallback=None):
 # content_list(value, maximum) -> list: a list field, bounded. Over the cap the
 # whole field is refused rather than truncated - half a batch is a different
 # batch, and applying part of one is how a replica diverges.
+#
+# No app calls this yet; it is kept as the shared shape for the sequence-typed
+# payload guard each app currently writes inline.
 def content_list(value, maximum):
 	if type(value) != "list":
 		return []
