@@ -835,11 +835,6 @@ def attachment_backoff_name(id, variant=""):
 def attachment_partial_name(id):
     return "partial/" + id
 
-# Whether this core carries the resumable-transfer primitives (cache.append /
-# size / rename and the stream writers' offset - one release, so one probe).
-def attachment_resume():
-    return hasattr(mochi.cache, "append")
-
 # attachment_pull(id, row, requester, variant="") ensures a remote attachment's
 # bytes are in cache, requesting them from the row's provenance entity. True
 # when present; None when the source could not be reached, False when it
@@ -877,7 +872,7 @@ def attachment_pull(id, row, requester, variant=""):
     declared = int(row.get("size", 0))
     partial = attachment_partial_name(id)
     offset = 0
-    if not variant and declared > 0 and attachment_resume():
+    if not variant and declared > 0:
         offset = mochi.cache.size(partial) or 0
         if offset >= declared:
             # A partial at or past the declared size cannot be right - the
@@ -915,7 +910,7 @@ def attachment_pull(id, row, requester, variant=""):
             # Bound the transfer to the size the row declares, so a peer cannot
             # push gigabytes through the disk before the size check runs. Core
             # cuts one byte past the bound, so an overrun fails the check below.
-            if not variant and declared > 0 and attachment_resume():
+            if not variant and declared > 0:
                 # Through the partial, so bytes survive an interruption and
                 # the next attempt continues instead of starting over.
                 total = mochi.cache.append(partial, stream, offset, maximum=declared - offset)
@@ -1046,7 +1041,7 @@ def attachment_respond(e, container, authorize, member=None):
         e.write({"status": "404"})
         return
     offset = attachment_number(e.content("offset", 0))
-    if offset and not variant and attachment_resume() and offset < attachment_number(row.get("size", 0)):
+    if offset and not variant and offset < attachment_number(row.get("size", 0)):
         e.write({"status": "200", "offset": offset})
         e.write.file(filename, offset=offset)
         return
@@ -1240,17 +1235,12 @@ def attachment_hex(text):
 # of an own row ("" for a remote one).
 attachment_export_file = "attachments.json"
 
-# attachment_export() returns the rows core's store held for this user and app:
-# the bridge if a core still has one, else the export file, else nothing. An
+# attachment_export() returns the rows core's store held for this user and app,
+# from the export file core wrote before dropping its own store. Absence means
+# no rows - core exported every store that had any before serving a request. An
 # export that exists and cannot be read aborts the migration - damaged, not
 # empty.
 def attachment_export():
-    if hasattr(mochi, "attachment") and hasattr(mochi.attachment, "export"):
-        rows = mochi.attachment.export()
-        if rows == None:
-            mochi.db.abort("attachment bridge unavailable")
-            return None
-        return rows
     if not mochi.file.exists(attachment_export_file):
         return []
     rows = json.decode(str(mochi.file.read(attachment_export_file) or ""), None)
