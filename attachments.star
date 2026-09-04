@@ -85,9 +85,12 @@ attachment_adopt_maximum = 32
 # back (or a lagging host that upgrades) heals without intervention.
 attachment_backoff_seconds = 300
 
-# The largest attachment attachment_data will build as a Starlark value. Not a
-# storage limit - it bounds one function that has to hold what it returns.
-attachment_memory_maximum = 64 * 1024 * 1024
+# How often one user's orphan sweep runs for an app, and the cache marker whose
+# age keeps the count. The sweep lists the whole file root and queries every
+# row, a cost that scales with the store, and it used to be paid on every
+# upload for orphans that almost never exist.
+attachment_sweep_seconds = 3600
+attachment_sweep_marker = "sweep"
 
 # The largest image variant a pull accepts. A variant declares no size, so
 # nothing else bounds it: without a ceiling the source could stream core's
@@ -243,10 +246,13 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
         content_type = attachment_text(meta.get("content_type", ""), attachment_name_maximum)
         if not content_type:
             content_type = attachment_content_type(name)
+        # The same ceiling the wire path applies on the way in: a longer local
+        # caption was stored whole here and cut to attachment_text_maximum by
+        # every replica, so the owner and its replicas held different text.
         stored.append({
             "id": id, "name": name, "size": size, "content_type": content_type,
-            "caption": captions[i] if i < len(captions) else "",
-            "description": descriptions[i] if i < len(descriptions) else "",
+            "caption": attachment_text(captions[i] if i < len(captions) else "", attachment_text_maximum),
+            "description": attachment_text(descriptions[i] if i < len(descriptions) else "", attachment_text_maximum),
         })
 
     if not stored:
@@ -266,7 +272,7 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
     handle.commit()
 
     results = [attachment_map(attachment_row(attachment["id"]), prefix, "") for attachment in stored]
-    attachment_sweep()
+    attachment_sweep_due()
     return results
 
 # attachment_create(object, name, data, content_type="", caption="",
@@ -299,13 +305,21 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
         mochi.file.write(attachment_filename(id, name), data)
     # A remote row carries no bytes, and the documented call passes None for
     # them; len() would abort the handler rather than record a zero.
-    attachment_row_append(id, object, name, len(data) if data else 0, content_type, "", caption, description, mochi.time.now(), entity)
+    attachment_row_append(id, object, name, len(data) if data else 0, content_type, "",
+                          attachment_text(caption, attachment_text_maximum),
+                          attachment_text(description, attachment_text_maximum),
+                          mochi.time.now(), entity)
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
-# attachment_receive(object, name, stream, ...) stores an attachment whose bytes
-# arrive on an open stream, straight to file storage with no whole-file
-# buffering, as an own row (entity ""). Pass id to preserve a federated one.
-def attachment_receive(object, name, stream, content_type="", id="", creator="", caption="", description=""):
+# attachment_receive(object, name, stream, ..., declared=None) stores an
+# attachment whose bytes arrive on an open stream, straight to file storage
+# with no whole-file buffering, as an own row (entity ""). Pass id to preserve
+# a federated one, and declared - the size the sender's metadata claims - when
+# the wire carries one: the transfer is then bounded to it and held to it
+# exactly. Core clamps a stream read to the receiver's remaining quota and
+# reports no truncation, so without a declaration a transfer cut short there
+# is recorded, at its truncated length, as a whole attachment.
+def attachment_receive(object, name, stream, content_type="", id="", creator="", caption="", description="", declared=None):
     name = attachment_name(name)
     # Same rule as attachment_create: a federated id is validated, never
     # substituted. wikis passes one straight off a P2P event.
@@ -318,48 +332,27 @@ def attachment_receive(object, name, stream, content_type="", id="", creator="",
         content_type = attachment_content_type(name)
     filename = attachment_filename(id, name)
     # Zero bytes is an empty file, a legitimate attachment, not a failure. The
-    # ceiling is the upload path's; core cuts one byte past it, so an oversized
-    # transfer is detectable here rather than truncated into a whole-looking
-    # file.
-    size = stream.read.file(filename, maximum=mochi.file.maximum())
+    # ceiling is the upload path's, tightened to the declaration when there is
+    # one so a sender cannot write the receiver's whole remaining quota before
+    # the size check; core cuts one byte past the bound either way, so an
+    # oversized transfer is detectable here rather than truncated into a
+    # whole-looking file.
+    limit = mochi.file.maximum()
+    if declared != None and attachment_transfer(declared) < limit:
+        limit = attachment_transfer(declared)
+    size = stream.read.file(filename, maximum=limit)
     if size > mochi.file.maximum():
         mochi.log.debug("attachment_receive refusing %s: transfer exceeds the object limit", name)
         mochi.file.delete(filename)
         return None
-    attachment_row_append(id, object, name, size, content_type, creator, caption, description, mochi.time.now(), "")
-    return attachment_map(attachment_row(id), mochi.app.url(), "")
-
-# attachment_insert(object, name, data, position, content_type="", caption="",
-# description="") stores an attachment from bytes at a specific 1-based rank,
-# shifting later attachments down. Returns the response dict.
-#
-# No app calls this yet; it is kept as the positional counterpart of
-# attachment_create, which every app does use.
-def attachment_insert(object, name, data, position, content_type="", caption="", description=""):
-    name = attachment_name(name)
-    if len(data) > mochi.file.maximum():
-        mochi.log.debug("attachment_insert refusing %s: %d bytes exceeds the object limit", name, len(data))
+    if declared != None and not attachment_complete(size, declared):
+        mochi.log.debug("attachment_receive refusing %s: received %d of a declared %d", name, size, declared)
+        mochi.file.delete(filename)
         return None
-    if not attachment_position(position):
-        return None
-    # A position past the end is an append, not a hole: unclamped, the shift
-    # matches nothing and the row lands beyond its neighbours, leaving a gap.
-    count = mochi.db.row("select count(*) as total from attachments where object=?", object)["total"]
-    if position > count + 1:
-        position = count + 1
-    id = mochi.uid()
-    if not content_type:
-        content_type = attachment_content_type(name)
-    mochi.file.write(attachment_filename(id, name), data)
-    # Shift and insert as one unit: separately, a concurrent insert at the same
-    # position shifts against a list the first has already moved, and both land
-    # on the same rank.
-    handle = mochi.db.transaction()
-    handle.execute("update attachments set rank = rank + 1 where object=? and rank >= ?", object, position)
-    handle.execute(
-        "insert into attachments ( id, object, entity, name, size, content_type, creator, caption, description, rank, created ) values ( ?, ?, '', ?, ?, ?, '', ?, ?, ?, ? )",
-        id, object, name, len(data), content_type, caption, description, position, mochi.time.now())
-    handle.commit()
+    attachment_row_append(id, object, name, size, content_type, creator,
+                          attachment_text(caption, attachment_text_maximum),
+                          attachment_text(description, attachment_text_maximum),
+                          mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_list(object, entity="") returns object's attachments ordered by
@@ -387,15 +380,28 @@ def attachment_delete(id):
     row = attachment_row(id)
     if not row:
         return False
-    # Remove and shift as one unit, for the same reason insert and move do:
-    # interleaved with either, a bare pair leaves the order decided by
-    # whichever statement landed last.
+    return attachment_remove(row)
+
+# attachment_remove(row) is the write half of attachment_delete, taking the
+# row the read half found - which may be stale by the time the delete runs,
+# as it is for the losing side of two deletes racing on one id. Remove and
+# shift as one unit, for the same reason move does: interleaved with a move,
+# a bare pair leaves the order decided by whichever statement landed last.
+# The delete reports the rank it removed - one statement, so the shift uses
+# the rank the row holds at that moment, not the one the read saw - and the
+# shift runs only when a row was removed: the loser used to find no row and
+# shift the object's ranks a second time, opening a gap in the order for the
+# next append to fall into.
+def attachment_remove(row):
     handle = mochi.db.transaction()
-    handle.execute("delete from attachments where id=?", id)
-    handle.execute("update attachments set rank = rank - 1 where object=? and rank > ?", row["object"], row["rank"])
+    removed = handle.row("delete from attachments where id=? returning object, rank", row["id"])
+    if not removed:
+        handle.rollback()
+        return False
+    handle.execute("update attachments set rank = rank - 1 where object=? and rank > ?", removed["object"], removed["rank"])
     handle.commit()
     if not row.get("entity"):
-        mochi.file.delete(attachment_filename(id, row["name"]))
+        mochi.file.delete(attachment_filename(row["id"], row["name"]))
     attachment_forget(row)
     return True
 
@@ -446,7 +452,9 @@ def attachment_position(position):
 def attachment_update(id, caption, description):
     if not attachment_exists(id):
         return None
-    mochi.db.execute("update attachments set caption=?, description=? where id=?", caption, description, id)
+    mochi.db.execute("update attachments set caption=?, description=? where id=?",
+                     attachment_text(caption, attachment_text_maximum),
+                     attachment_text(description, attachment_text_maximum), id)
     return attachment_map(attachment_row(id), mochi.app.url(), "")
 
 # attachment_copy(id, object, requester, caption, description) duplicates an
@@ -466,9 +474,8 @@ def attachment_copy(id, object, requester="", caption="", description=""):
             return None
         size = mochi.cache.copy(attachment_cache_name(id), destination)
     else:
-        # Same guard as attachment_data: the copy primitive raises on a
-        # missing source, and a row whose file is gone should degrade, not
-        # abort.
+        # The copy primitive raises on a missing source, and Starlark cannot
+        # catch that: a row whose file is gone should degrade, not abort.
         source = attachment_filename(id, name)
         if not mochi.file.exists(source):
             return None
@@ -477,7 +484,9 @@ def attachment_copy(id, object, requester="", caption="", description=""):
         return None
 
     attachment_row_append(new, object, name, size, row.get("content_type", ""), "",
-                          caption, description, mochi.time.now(), "")
+                          attachment_text(caption, attachment_text_maximum),
+                          attachment_text(description, attachment_text_maximum),
+                          mochi.time.now(), "")
     return attachment_map(attachment_row(new), mochi.app.url(), "")
 
 # attachment_fetch(id, requester="") makes sure a remote attachment's bytes are
@@ -518,37 +527,11 @@ def attachment_extract(archive, entry, object, name, content_type="", caption=""
         return None
     if not content_type:
         content_type = attachment_content_type(name)
-    attachment_row_append(id, object, name, size, content_type, "", caption, description,
+    attachment_row_append(id, object, name, size, content_type, "",
+                          attachment_text(caption, attachment_text_maximum),
+                          attachment_text(description, attachment_text_maximum),
                           mochi.time.now(), "")
     return attachment_map(attachment_row(id), mochi.app.url(), "")
-
-# attachment_data(id, requester="") returns an attachment's bytes, or None. A
-# remote row is pulled from its source on demand and read from cache; pass
-# requester (a.user.identity.id) whenever the row may be remote.
-#
-# NOT SAFE FROM A PUBLIC ACTION: the own-row branch reads through mochi.file,
-# which resolves the CALLER and raises "no user" for an anonymous one - an
-# uncatchable abort, so the handler dies with a 500. attachment_serve avoids
-# mochi.file for exactly this reason. No app calls this today; it is kept as the
-# documented way to materialise bytes for an export.
-def attachment_data(id, requester=""):
-    row = attachment_row(id)
-    if not row:
-        return None
-    # The one path that materialises an attachment as a Starlark value, in a
-    # process every user shares; callers moving bytes want attachment_copy or
-    # attachment_entry. Bound the primitive, never the row's size - it is a
-    # claim.
-    if row.get("entity"):
-        if not attachment_pull(id, row, requester):
-            return None
-        return mochi.cache.read(attachment_cache_name(id), maximum=attachment_memory_maximum)
-    # The file primitives raise on a missing source and Starlark cannot catch
-    # that, so the documented "or None" needs this existence check.
-    filename = attachment_filename(id, row["name"])
-    if not mochi.file.exists(filename):
-        return None
-    return mochi.file.read(filename, maximum=attachment_memory_maximum)
 
 # ---------------------------------------------------------------------------
 # Variants and cache naming
@@ -563,12 +546,17 @@ def attachment_cache_name(id, variant=""):
     return "remote/" + id
 
 # attachment_forget drops an attachment's cache entries: a remote copy's
-# original and variants, and an own image's rendered variants.
+# original and variants with their pull bookkeeping, and an own image's
+# rendered variants.
 def attachment_forget(row):
     if row.get("entity"):
-        mochi.cache.delete(attachment_cache_name(row["id"], ""))
-        mochi.cache.delete(attachment_cache_name(row["id"], "thumbnail"))
-        mochi.cache.delete(attachment_cache_name(row["id"], "preview"))
+        for variant in ["", "thumbnail", "preview"]:
+            mochi.cache.delete(attachment_cache_name(row["id"], variant))
+            # A backoff marker left behind handed its verdict to any row
+            # re-filed under this id inside the window, and a leftover
+            # partial would resume a transfer the new row never started.
+            mochi.cache.delete(attachment_backoff_name(row["id"], variant))
+        mochi.cache.delete(attachment_partial_name(row["id"]))
         return
     # An own image's variants live in cache under a name derived from the
     # file's, mirroring core's variant naming. The test suite holds the
@@ -688,6 +676,12 @@ def attachment_store(rows, entity, object):
     if type(rows) not in ["list", "tuple"]:
         return []
     if type(object) != "string" or not object:
+        return []
+    # The entity is the rows' provenance and the source every later pull
+    # dials; without one the rows landed as OWN rows (entity ''), bytes-less
+    # and served from a file that does not exist. An event with no from
+    # header reaches attachment_accept with exactly that.
+    if type(entity) != "string" or not entity:
         return []
     if len(rows) > attachment_store_maximum:
         mochi.log.debug("attachment_store truncating %d rows to %d", len(rows), attachment_store_maximum)
@@ -914,7 +908,15 @@ def attachment_pull(id, row, requester, variant=""):
                 # Through the partial, so bytes survive an interruption and
                 # the next attempt continues instead of starting over.
                 total = mochi.cache.append(partial, stream, offset, maximum=declared - offset)
-                if attachment_complete(total, declared, variant):
+                if total == None:
+                    # The primitive answers None when the transfer could not
+                    # run - the partial is held by another transfer, its size
+                    # moved under us, or the write failed - rather than
+                    # raising, which aborted the handler that was serving.
+                    # The transport class: whatever the partial holds stays
+                    # for the retry.
+                    outcome = None
+                elif attachment_complete(total, declared, variant):
                     mochi.cache.rename(partial, name)
                     outcome = True
                 elif total > declared:
@@ -929,11 +931,12 @@ def attachment_pull(id, row, requester, variant=""):
                     outcome = None
             else:
                 written = mochi.cache.write(name, stream, maximum=attachment_transfer(declared, variant))
-                if attachment_complete(written, declared, variant):
+                if written != None and attachment_complete(written, declared, variant):
                     outcome = True
                 else:
-                    # A truncated or padded transfer: the source holds the
-                    # bytes and the wire failed to carry them, so the next
+                    # A truncated or padded transfer, or a write the cache
+                    # could not commit (None): the source holds the bytes and
+                    # the wire or the disk failed to carry them, so the next
                     # retry may succeed - the transport class, not a verdict.
                     mochi.cache.delete(name)
                     outcome = None
@@ -1032,7 +1035,7 @@ def attachment_respond(e, container, authorize, member=None):
     # requester starts over cleanly. Bounds-checked against the row's size,
     # which for a local row is the file's.
     # The status goes out before the body, so an own row whose file is missing
-    # (the orphan attachment_data and attachment_copy both guard against) would
+    # (the orphan attachment_copy guards against) would
     # answer 200 with nothing behind it - which attachment_pull reads as a
     # transport failure and retries every backoff forever instead of learning
     # the bytes are gone.
@@ -1119,21 +1122,16 @@ def attachment_push_receive(e, object, creator=""):
     # reads this before writing them (see attachment_push on why the phases
     # must alternate).
     e.write({"status": "100"})
+    # The declaration bounds the transfer and is held to exactly, as the pull
+    # path holds its row's size: without it a pusher wrote the owner's whole
+    # remaining quota before any check ran, and a transfer core cut short at
+    # that quota was recorded at its truncated length and acked 200 - every
+    # subscriber then pulled a prefix that looked complete, because the row
+    # agreed with it.
     attachment = attachment_receive(object, name, e, content_type, id,
-                                    creator=creator, caption=caption, description=description)
+                                    creator=creator, caption=caption, description=description,
+                                    declared=declared)
     if not attachment:
-        e.write({"status": "400"})
-        return None
-    # The pull path verifies the transfer against the declared size; this one
-    # did not. Core clamps the reader to the receiver's remaining quota and
-    # returns the byte count with NO truncation signal, so a transfer cut short
-    # by the quota was written, recorded at its truncated length and acked 200 -
-    # and every subscriber then pulled a prefix that looked complete, because
-    # the row agreed with it.
-    if not attachment_complete(attachment_number(attachment["size"]), declared):
-        mochi.log.debug("attachment_push_receive %s: received %d of a declared %d",
-                        id, attachment_number(attachment["size"]), declared)
-        attachment_delete(id)
         e.write({"status": "400"})
         return None
     e.write({"status": "200"})
@@ -1217,6 +1215,18 @@ def attachment_sweep(age=3600):
             continue
         mochi.file.delete(filename)
 
+# attachment_sweep_due(age=3600) runs the orphan sweep when the last one is
+# older than attachment_sweep_seconds, or none has run, and reports whether it
+# ran. The marker is written first, so a sweep that aborts is not retried on
+# every upload. age is the sweep's own settling period, passed through.
+def attachment_sweep_due(age=3600):
+    since = mochi.cache.age(attachment_sweep_marker)
+    if since != None and since < attachment_sweep_seconds:
+        return False
+    mochi.cache.write(attachment_sweep_marker, "")
+    attachment_sweep(age)
+    return True
+
 # attachment_hex reports whether every character is a lowercase hex digit, so
 # the orphan sweep only touches uid-shaped names.
 def attachment_hex(text):
@@ -1251,8 +1261,8 @@ def attachment_export():
 
 # attachment_migrate() copies attachment rows out of core's store into this
 # app's table, once, from a database_upgrade step. Ids are preserved verbatim
-# (URLs and remote references depend on them); own rows keep their files in
-# place.
+# (URLs and remote references depend on them); an own row's file moves to the
+# name this library addresses when core kept it under another.
 def attachment_migrate():
     rows = attachment_export()
     if rows == None:
@@ -1267,8 +1277,34 @@ def attachment_migrate():
         id = attachment.get("id")
         if not attachment_identifier(id) or attachment_exists(id):
             continue
+        name = attachment_name(attachment.get("name", ""))
+        entity = attachment_text(attachment.get("entity", ""), attachment_name_maximum)
+        if not entity:
+            attachment_relocate(id, name, attachment.get("file", ""))
         attachment_row_write(
-            id, attachment.get("object", ""), attachment.get("name", ""), attachment.get("size", 0),
+            id, attachment.get("object", ""), name, attachment.get("size", 0),
             attachment.get("content_type", ""), attachment.get("creator", ""), attachment.get("caption", ""),
             attachment.get("description", ""), attachment.get("rank", 0),
-            attachment.get("created", 0) or mochi.time.now(), attachment.get("entity", ""))
+            attachment.get("created", 0) or mochi.time.now(), entity)
+
+# attachment_relocate(id, name, stored) moves a migrated own row's bytes from the
+# name core's store kept them under - "file" in the export, recorded verbatim -
+# to the name this library addresses, when the two differ. The library derives
+# the address from the row's name through mochi.file.clean and core's store did
+# not, so a name that rule rewrites (over the component limit, or carrying a
+# character it replaces) left the row pointing at nothing while its bytes sat
+# under the old name. A stored name the path validator refuses cannot be moved
+# from Starlark at all - mochi.file raises on it - and is left for a repair by
+# hand rather than aborting the migration, which would be permanent.
+def attachment_relocate(id, name, stored):
+    if type(stored) != "string" or not stored:
+        return
+    canonical = attachment_filename(id, name)
+    if stored == canonical:
+        return
+    if not mochi.text.valid(stored, "filepath"):
+        mochi.log.debug("attachment_migrate %s: stored name is not a valid path, bytes left under it", id)
+        return
+    if not mochi.file.exists(stored) or mochi.file.exists(canonical):
+        return
+    mochi.file.move(stored, canonical)

@@ -5,5 +5,3 @@
 
 check:
 	python3 tools/check.py
-
-clean:
