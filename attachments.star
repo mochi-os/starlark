@@ -364,11 +364,53 @@ def attachment_list(object, entity=""):
     rows = mochi.db.rows("select * from attachments where object=? order by rank", object)
     return [attachment_map(row, prefix, entity) for row in rows]
 
+# attachment_list_many(objects, entity) returns {object: [mapped attachments]}
+# for every id in objects, in one query, so a caller listing attachments across
+# many rows (a comment tree, a message page) pays one query instead of N. Ids
+# absent from the result map to an empty list. Ordering within each object
+# matches attachment_list (by rank).
+def attachment_list_many(objects, entity=""):
+    result = {}
+    unique = []
+    for o in objects:
+        if o != None and o != "" and o not in result:
+            result[o] = []
+            unique.append(o)
+    if not unique:
+        return result
+    prefix = mochi.app.url()
+    places = ",".join(["?"] * len(unique))
+    rows = mochi.db.rows("select * from attachments where object in (" + places + ") order by object, rank", *unique)
+    for row in rows:
+        result[row["object"]].append(attachment_map(row, prefix, entity))
+    return result
+
 def attachment_get(id, entity=""):
     row = attachment_row(id)
     if not row:
         return None
     return attachment_map(row, mochi.app.url(), entity)
+
+# attachment_get_many(ids, entity) returns {id: mapped attachment} for every id
+# in ids, in one query - the batched form of attachment_get, so a caller
+# resolving many attachment ids (a comment tree's anchors) pays one query
+# instead of N. Ids with no row are simply absent from the map.
+def attachment_get_many(ids, entity=""):
+    unique = []
+    seen = {}
+    for i in ids:
+        if i != None and i != "" and i not in seen:
+            seen[i] = True
+            unique.append(i)
+    if not unique:
+        return {}
+    prefix = mochi.app.url()
+    places = ",".join(["?"] * len(unique))
+    rows = mochi.db.rows("select * from attachments where id in (" + places + ")", *unique)
+    out = {}
+    for row in rows:
+        out[row["id"]] = attachment_map(row, prefix, entity)
+    return out
 
 def attachment_exists(id):
     return mochi.db.exists("select 1 from attachments where id=?", id)
