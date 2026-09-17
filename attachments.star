@@ -97,6 +97,10 @@ attachment_sweep_marker = "sweep"
 # 10 GB object maximum and it would be kept and served as the thumbnail.
 attachment_variant_maximum = 16 * 1024 * 1024
 
+# attachment_relay_maximum bounds one relayed original (attachment_relay). A
+# relay has no row to declare a size, so the ceiling is fixed.
+attachment_relay_maximum = 100 * 1024 * 1024
+
 # attachment_room is the name length a filename can hold once the id and its
 # separator are taken out. Both helpers below derive from it, so they cannot
 # drift: attachment_name runs before the id exists and assumes the id length
@@ -1065,7 +1069,7 @@ def attachment_respond(e, container, authorize, member=None):
     if variant and attachment_is_image(row["name"]):
         name = mochi.image.variant(attachment_filename(id, row["name"]), variant)
         if name:
-            e.write({"status": "200"})
+            e.write({"status": "200", "name": row["name"]})
             e.write.cache(name)
             return
 
@@ -1087,11 +1091,48 @@ def attachment_respond(e, container, authorize, member=None):
         return
     offset = attachment_number(e.content("offset", 0))
     if offset and not variant and offset < attachment_number(row.get("size", 0)):
-        e.write({"status": "200", "offset": offset})
+        e.write({"status": "200", "offset": offset, "name": row["name"]})
         e.write.file(filename, offset=offset)
         return
-    e.write({"status": "200"})
+    e.write({"status": "200", "name": row["name"]})
     e.write.file(filename)
+
+# attachment_relay(a, container, id, variant) streams an attachment of a
+# container this server does not hold from the container's entity to the
+# caller, as an app's remote view fetches the posts. The caller's own identity
+# opens the stream, so the source's responder applies its access rules to
+# them on every request. Nothing is stored or cached: the cache is keyed by
+# attachment alone, and would hand a later, denied caller the bytes without
+# the source being asked. The app gates on a signed-in caller first.
+def attachment_relay(a, container, id, variant=""):
+    if not a.user or not a.user.identity:
+        a.error.label(401, "attachment.errors.denied")
+        return
+    if not attachment_identifier(id) or variant not in ["", "thumbnail", "preview"]:
+        a.error.label(404, "attachment.errors.not_found")
+        return
+    services = mochi.app.services()
+    stream = mochi.stream(
+        {"from": a.user.identity.id, "to": container, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
+        {"id": id, "variant": variant})
+    if not stream:
+        a.error.label(503, "attachment.errors.unavailable")
+        return
+    response = stream.read()
+    if not response:
+        a.error.label(503, "attachment.errors.unavailable")
+        return
+    if response.get("status") == "403":
+        a.error.label(403, "attachment.errors.denied")
+        return
+    if response.get("status") != "200":
+        a.error.label(404, "attachment.errors.not_found")
+        return
+    # The name is the source's claim; core sanitises what it serves by type.
+    name = response.get("name")
+    if type(name) == "string" and name:
+        a.header("Content-Type", mochi.file.type(name))
+    a.write.stream(stream, maximum=attachment_variant_maximum if variant else attachment_relay_maximum)
 
 # attachment_push(container, object, stored, requester) streams locally saved
 # attachments to container's owner, one attachment/push stream each: metadata,
