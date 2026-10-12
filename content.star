@@ -1,8 +1,6 @@
 # Mochi shared Starlark library: Peer-supplied content
 # Copyright © 2026 Mochisoft OÜ
-# SPDX-License-Identifier: AGPL-3.0-only
-# This file is part of Mochi, licensed under the GNU AGPL v3 with the Mochi
-# Application Interface Exception - see license.txt and license-exception.md.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Reading values a peer or client supplied without the handler dying on them.
 # Starlark has no try/except, so a type error - ordering a peer's string against

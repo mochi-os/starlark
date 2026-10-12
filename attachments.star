@@ -1,8 +1,6 @@
 # Mochi shared Starlark library: Attachments
 # Copyright © 2026 Mochisoft OÜ
-# SPDX-License-Identifier: AGPL-3.0-only
-# This file is part of Mochi, licensed under the GNU AGPL v3 with the Mochi
-# Application Interface Exception - see license.txt and license-exception.md.
+# SPDX-License-Identifier: Apache-2.0
 #
 # App-owned file attachments: each app vendors this file (a symlink into
 # apps/<app>/lib/, listed first in app.json "execute") and owns its attachments
