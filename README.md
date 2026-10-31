@@ -10,6 +10,10 @@ apps stay self-contained and pin the version they shipped with.
 - `attachments.star` — app-owned file attachments (storage, serving, P2P
   byte-pull, image variants, migration off core's built-in attachment store).
   See `claude/plans/starlark-libraries.md` in the umbrella.
+- `assets.star` - relays an entity's asset (a person's avatar or style) from
+  the service that owns it, held in cache space for the response's max-age.
+- `recommendations.star` - the recommendations service's list for a type and
+  language, held in cache space for an hour.
 
 ## Checks
 
