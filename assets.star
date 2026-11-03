@@ -90,9 +90,14 @@ def asset_serve(a, entity, service, asset, lifetime=asset_lifetime, public=False
     # An anonymous caller on an entity's route runs with the entity owner's
     # storage, and keeps its entries apart there: the owner's own were fetched
     # as the owner, and an anonymous caller is answered only what a fetch
-    # naming nobody is. Anonymous on a class route has no storage at all.
+    # naming nobody is. Anonymous on a class route has no storage at all. A
+    # signed-in visitor to an entity a hosted domain publishes under a context
+    # runs with the owner's storage too, and keeps entries of their own there,
+    # fetched as themselves.
     if a.user == None:
         name = "anonymous/" + name
+    elif a.entity != None and not a.owner and a.domain.route != None and a.domain.route.context:
+        name = "viewer/" + a.user.id + "/" + name
     record = name + ".json"
     cached = (a.user != None or a.entity != None) and mochi.text.valid(record, "filepath")
     if cached:
