@@ -95,6 +95,15 @@ attachment_sweep_marker = "sweep"
 # 10 GB object maximum and it would be kept and served as the thumbnail.
 attachment_variant_maximum = 16 * 1024 * 1024
 
+# The image variants the library serves, smallest first: thumbnail for chips
+# and lists, medium for card and gallery tiles, preview for full-width views.
+attachment_variant_kinds = ["thumbnail", "medium", "preview"]
+
+# The most bytes of a stored file read back to learn its type from its
+# signature. core's own ceiling for a file read whole into a handler; an image
+# past it keeps the type it was declared with.
+attachment_sniff_maximum = 32 * 1024 * 1024
+
 # attachment_relay_maximum bounds one relayed original (attachment_relay). A
 # relay has no row to declare a size, so the ceiling is fixed.
 attachment_relay_maximum = 100 * 1024 * 1024
@@ -143,6 +152,117 @@ def attachment_content_type(name):
         if lower.endswith(ext):
             return types[ext]
     return "application/octet-stream"
+
+# attachment_sniff(data) -> string: The image type the bytes carry in their own
+# signature, or "" for bytes that carry none of the image formats below. A
+# browser's declared type is whatever its platform guessed, often from the
+# file name, and an extension is a guess too: JPEG bytes uploaded as image/png
+# were stored and federated as PNG. Only the leading bytes are read.
+def attachment_sniff(data):
+    if type(data) == "string":
+        data = bytes(data)
+    if type(data) != "bytes":
+        return ""
+    head = data[:64]
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:6] == b"GIF87a" or head[:6] == b"GIF89a":
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[4:8] == b"ftyp":
+        return attachment_sniff_brand(head)
+    if head[:4] == b"\x00\x00\x01\x00" and len(head) >= 6 and head[4:6] != b"\x00\x00":
+        return "image/x-icon"
+    if attachment_sniff_svg(data[:4096]):
+        return "image/svg+xml"
+    return ""
+
+# The ISO media file a ftyp box opens: AVIF, or HEIF, by its major or any
+# compatible brand. Anything else in that container (a video) is not an image.
+def attachment_sniff_brand(head):
+    values = list(head.elems())
+    size = values[0] * 16777216 + values[1] * 65536 + values[2] * 256 + values[3]
+    end = size if size >= 16 and size <= len(values) else len(values)
+    brands = [head[8:12]]
+    for offset in range(16, end - 3, 4):
+        brands.append(head[offset:offset + 4])
+    if b"avif" in brands or b"avis" in brands:
+        return "image/avif"
+    for brand in [b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"]:
+        if brand in brands:
+            return "image/heif"
+    return ""
+
+# Whether text opens an SVG document: an svg element first, after the
+# whitespace, XML declaration, comments and doctype a document may lead with.
+def attachment_sniff_svg(data):
+    text = str(data)
+    if text.startswith("\ufeff"):
+        text = text[len("\ufeff"):]
+    for _ in range(16):
+        text = text.lstrip()
+        if text.startswith("<?"):
+            end = text.find("?>")
+            end = end + 2 if end >= 0 else -1
+        elif text.startswith("<!--"):
+            end = text.find("-->")
+            end = end + 3 if end >= 0 else -1
+        elif text[:9].lower() == "<!doctype":
+            end = attachment_sniff_doctype(text)
+        else:
+            break
+        if end < 0:
+            return False
+        text = text[end:]
+    if not text.startswith("<svg"):
+        return False
+    return len(text) == 4 or text[4] in " \t\r\n>/"
+
+# The length of the doctype text opens with. Its internal subset, between [
+# and ], holds a > of its own in every entity or comment it declares, as an
+# illustration program's export carries them; quoted values may hold any of
+# the three. -1 for a doctype left open.
+def attachment_sniff_doctype(text):
+    quote = ""
+    subset = False
+    comment = False
+    for i in range(9, len(text)):
+        c = text[i]
+        if comment:
+            if c == ">" and text[i - 2:i] == "--":
+                comment = False
+        elif quote:
+            if c == quote:
+                quote = ""
+        elif c == "\"" or c == "'":
+            quote = c
+        elif subset and text[i:i + 4] == "<!--":
+            comment = True
+        elif c == "[":
+            subset = True
+        elif c == "]":
+            subset = False
+        elif c == ">" and not subset:
+            return i + 1
+    return -1
+
+# attachment_type(name, declared, file="", data=None) -> string: The content
+# type to record for an attachment: the type its bytes carry where they carry
+# an image signature, otherwise the declared type, otherwise the name's. Only an
+# attachment declared or named as an image is read: the bytes are in data where
+# the caller holds them, or read back from file storage.
+def attachment_type(name, declared, file="", data=None):
+    if type(declared) != "string":
+        declared = ""
+    fallback = declared or attachment_content_type(name)
+    if not declared.lower().startswith("image/") and not attachment_content_type(name).startswith("image/"):
+        return fallback
+    if data == None and file and mochi.file.age(file) != None:
+        data = mochi.file.read(file, attachment_sniff_maximum)
+    return attachment_sniff(data) or fallback
 
 # Writes a row at the end of object's order, choosing the rank inside the
 # insert: handlers are not serialised per user, so a read-then-write pair races
@@ -244,10 +364,9 @@ def attachment_save(a, object, field="files", captions=[], descriptions=[]):
         # and received as a prefix by every subscriber, silently.
         size = a.upload(field, attachment_filename(id, name), index=i, maximum=mochi.file.maximum())
         # Bounded like the P2P path's: the browser chooses this string and it
-        # reaches the column, the response dicts and the fan-out.
-        content_type = attachment_text(meta.get("content_type", ""), attachment_name_maximum)
-        if not content_type:
-            content_type = attachment_content_type(name)
+        # reaches the column, the response dicts and the fan-out. An image's
+        # own bytes overrule it.
+        content_type = attachment_type(name, attachment_text(meta.get("content_type", ""), attachment_name_maximum), attachment_filename(id, name))
         # The same ceiling the wire path applies on the way in: a longer local
         # caption was stored whole here and cut to attachment_text_maximum by
         # every replica, so the owner and its replicas held different text.
@@ -301,8 +420,8 @@ def attachment_create(object, name, data, content_type="", caption="", descripti
         return None
     if not id:
         id = mochi.uid()
-    if not content_type:
-        content_type = attachment_content_type(name)
+    # A remote row has no bytes to read, so it keeps its claim.
+    content_type = attachment_type(name, content_type, data=None if entity else data)
     if not entity:
         mochi.file.write(attachment_filename(id, name), data)
     # A remote row carries no bytes, and the documented call passes None for
@@ -330,8 +449,6 @@ def attachment_receive(object, name, stream, content_type="", id="", creator="",
         return None
     if not id:
         id = mochi.uid()
-    if not content_type:
-        content_type = attachment_content_type(name)
     filename = attachment_filename(id, name)
     # Zero bytes is an empty file, a legitimate attachment, not a failure. The
     # ceiling is the upload path's, tightened to the declaration when there is
@@ -351,6 +468,7 @@ def attachment_receive(object, name, stream, content_type="", id="", creator="",
         mochi.log.debug("attachment_receive refusing %s: received %d of a declared %d", name, size, declared)
         mochi.file.delete(filename)
         return None
+    content_type = attachment_type(name, content_type, filename)
     attachment_row_append(id, object, name, size, content_type, creator,
                           attachment_text(caption, attachment_text_maximum),
                           attachment_text(description, attachment_text_maximum),
@@ -569,8 +687,7 @@ def attachment_extract(archive, entry, object, name, content_type="", caption=""
     size = mochi.archive.extract(archive, entry, attachment_filename(id, name))
     if size == None:
         return None
-    if not content_type:
-        content_type = attachment_content_type(name)
+    content_type = attachment_type(name, content_type, attachment_filename(id, name))
     attachment_row_append(id, object, name, size, content_type, "",
                           attachment_text(caption, attachment_text_maximum),
                           attachment_text(description, attachment_text_maximum),
@@ -582,8 +699,8 @@ def attachment_extract(archive, entry, object, name, content_type="", caption=""
 # ---------------------------------------------------------------------------
 
 # The cache entry name for a remote copy: the original when variant is empty, or
-# a per-variant entry (thumbnail, preview). Ids are unique, so entries never
-# collide across attachments.
+# a per-variant entry (thumbnail, medium, preview). Ids are unique, so entries
+# never collide across attachments.
 def attachment_cache_name(id, variant=""):
     if variant:
         return "remote/" + id + "_" + variant
@@ -594,7 +711,7 @@ def attachment_cache_name(id, variant=""):
 # rendered variants.
 def attachment_forget(row):
     if row.get("entity"):
-        for variant in ["", "thumbnail", "preview"]:
+        for variant in [""] + attachment_variant_kinds:
             mochi.cache.delete(attachment_cache_name(row["id"], variant))
             # A backoff marker left behind handed its verdict to any row
             # re-filed under this id inside the window, and a leftover
@@ -608,18 +725,42 @@ def attachment_forget(row):
     # fails loudly.
     if attachment_is_image(row["name"]):
         filename = attachment_filename(row["id"], row["name"])
-        mochi.cache.delete("variants/" + attachment_variant_name(filename, "thumbnail"))
-        mochi.cache.delete("variants/" + attachment_variant_name(filename, "preview"))
+        for kind in attachment_variant_kinds:
+            mochi.cache.delete("variants/" + attachment_variant_name(filename, kind))
 
 # The cache entry stem core's variant renderer uses: the file name with the
-# kind spliced in ahead of the extension.
+# kind spliced in ahead of the extension of the format the variant is encoded
+# in - the source's own, except a WebP's, which core encodes as JPEG.
 def attachment_variant_name(filename, kind):
     extension = ""
     index = filename.rfind(".")
     if index >= 0:
         extension = filename[index:]
         filename = filename[:index]
+    if extension.lower() == ".webp":
+        extension = ".jpg"
     return filename + "_" + kind + extension
+
+# attachment_variant_kind(kind) -> string: The kind to ask mochi.image.variant
+# for. A core from before mochi.image.kinds renders thumbnails and previews
+# only, and raises for any other kind, so a medium is asked of it as a preview.
+def attachment_variant_kind(kind):
+    if kind == "thumbnail" or kind == "preview":
+        return kind
+    if hasattr(mochi.image, "kinds") and kind in mochi.image.kinds():
+        return kind
+    return "preview"
+
+# The content type of a variant pulled from an attachment's source. A variant
+# is encoded in its original's format except a WebP's, which is JPEG where the
+# source rendered one and the WebP itself where the source served the original
+# instead, so only that case reads the bytes.
+def attachment_pulled_type(row, entry):
+    named = mochi.file.type(attachment_variant_name(row["name"], "variant"))
+    if named == mochi.file.type(row["name"]):
+        return named
+    data = mochi.cache.read(entry, maximum=attachment_variant_maximum)
+    return attachment_sniff(data) or named
 
 # ---------------------------------------------------------------------------
 # HTTP serving (the action is the gate)
@@ -643,8 +784,10 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
     # falling back to the original when a variant cannot be produced. The
     # content type derives from the attachment's NAME on every branch, never
     # from the row's content_type column - for a remote row that column is the
-    # peer's claim.
+    # peer's claim - and a variant's from the variant's own name.
     kind = mochi.file.type(row["name"])
+    if variant and variant not in attachment_variant_kinds:
+        variant = ""
     if row.get("entity"):
         requester = a.user.identity.id if (a.user and a.user.identity) else container
         # Only the container's canonical holder adopts, taking the bytes in on
@@ -657,11 +800,20 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
             # at any moment - an eviction between the pull and the serve would
             # otherwise be an empty 200 with a cacheable ETag. Fall through to
             # the original, then to the error, exactly as the own-row branch
-            # falls through from a variant that could not be rendered.
-            want = variant if (variant and attachment_is_image(row["name"])) else ""
-            if want and attachment_pull(id, row, requester, want):
-                if a.write.cache(attachment_cache_name(id, want), content_type=kind):
-                    return
+            # falls through from a variant that could not be rendered. A medium
+            # a source refuses falls back to the preview first: a source whose
+            # library predates mediums refuses the kind.
+            wants = []
+            if variant and attachment_is_image(row["name"]):
+                wants = [variant, "preview"] if variant == "medium" else [variant]
+            for want in wants:
+                got = attachment_pull(id, row, requester, want)
+                if got:
+                    entry = attachment_cache_name(id, want)
+                    if a.write.cache(entry, content_type=attachment_pulled_type(row, entry)):
+                        return
+                if got == None:
+                    break
             pulled = attachment_pull(id, row, requester, "")
             if pulled:
                 if a.write.cache(attachment_cache_name(id, ""), content_type=kind):
@@ -678,10 +830,11 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
             return
 
     # Own row: serve the original from file storage, or an image variant which
-    # mochi.image.variant renders into cache on demand.
+    # mochi.image.variant renders into cache on demand, typed by its own name:
+    # a WebP's variants are JPEG.
     if variant and attachment_is_image(row["name"]):
-        name = mochi.image.variant(attachment_filename(id, row["name"]), variant)
-        if name and a.write.cache(name, content_type=kind):
+        name = mochi.image.variant(attachment_filename(id, row["name"]), attachment_variant_kind(variant))
+        if name and a.write.cache(name, content_type=mochi.file.type(name)):
             return
     # a.write.file reads the route entity OWNER's storage, while the row above
     # came from mochi.db and the variant above from mochi.image.variant, both of
@@ -1041,13 +1194,13 @@ def attachment_respond(e, container, authorize, member=None):
         return
     # The id and variant are the peer's claims, and both feed functions that
     # abort on a bad shape - the variant goes to mochi.image.variant, which
-    # raises for anything but its two kinds, so an unvalidated one let a peer
+    # raises for any kind it does not render, so an unvalidated one let a peer
     # kill our responder with a single word.
     id = e.content("id")
     if not attachment_identifier(id):
         e.write({"status": "400"})
         return
-    if e.content("variant", "") not in ["", "thumbnail", "preview"]:
+    if e.content("variant", "") not in [""] + attachment_variant_kinds:
         e.write({"status": "400"})
         return
     row = attachment_row(id)
@@ -1062,12 +1215,14 @@ def attachment_respond(e, container, authorize, member=None):
 
     # A requester may ask for an image variant; render it from our own original
     # so the subscriber pulls the small copy rather than the full image. A
-    # variant that cannot be produced falls back to the original.
+    # variant that cannot be produced falls back to the original. The name
+    # answered is the variant's, which the relay types the bytes by: a WebP's
+    # variant is a JPEG.
     variant = e.content("variant", "")
     if variant and attachment_is_image(row["name"]):
-        name = mochi.image.variant(attachment_filename(id, row["name"]), variant)
+        name = mochi.image.variant(attachment_filename(id, row["name"]), attachment_variant_kind(variant))
         if name:
-            e.write({"status": "200", "name": row["name"]})
+            e.write({"status": "200", "name": attachment_variant_name(row["name"], variant)})
             e.write.cache(name)
             return
 
@@ -1106,20 +1261,25 @@ def attachment_relay(a, container, id, variant=""):
     if not a.user or not a.user.identity:
         a.error.label(401, "attachment.errors.denied")
         return
-    if not attachment_identifier(id) or variant not in ["", "thumbnail", "preview"]:
+    if not attachment_identifier(id) or variant not in [""] + attachment_variant_kinds:
         a.error.label(404, "attachment.errors.not_found")
         return
     services = mochi.app.services()
-    stream = mochi.stream(
-        {"from": a.user.identity.id, "to": container, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
-        {"id": id, "variant": variant})
-    if not stream:
-        a.error.label(503, "attachment.errors.unavailable")
-        return
-    response = stream.read()
-    if not response:
-        a.error.label(503, "attachment.errors.unavailable")
-        return
+    # A source whose library predates mediums refuses the kind as malformed,
+    # so a medium is asked again as a preview.
+    for want in ([variant, "preview"] if variant == "medium" else [variant]):
+        stream = mochi.stream(
+            {"from": a.user.identity.id, "to": container, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
+            {"id": id, "variant": want})
+        if not stream:
+            a.error.label(503, "attachment.errors.unavailable")
+            return
+        response = stream.read()
+        if not response:
+            a.error.label(503, "attachment.errors.unavailable")
+            return
+        if response.get("status") != "400" or want != "medium":
+            break
     if response.get("status") == "403":
         a.error.label(403, "attachment.errors.denied")
         return
@@ -1250,7 +1410,9 @@ def attachment_adopt(id, requester=""):
     size = mochi.cache.copy(attachment_cache_name(id), attachment_filename(id, row["name"]))
     if size == None:
         return False
-    mochi.db.execute("update attachments set entity='', size=? where id=?", size, id)
+    # The type too, now the bytes are ours to read: the row's was the peer's claim.
+    content_type = attachment_type(row["name"], row.get("content_type", ""), attachment_filename(id, row["name"]))
+    mochi.db.execute("update attachments set entity='', size=?, content_type=? where id=?", size, content_type, id)
     # The remote-name cache entries are orphans once the row is ours; variants
     # re-render from the file under their own naming.
     attachment_forget(row)

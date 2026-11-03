@@ -74,8 +74,8 @@ def asset_name(service, entity, asset):
 # returned. public marks the response cacheable by shared caches. version is a
 # token the page sends to fetch a changed asset at once - the menu reloading
 # the user's own avatar after they change it - and names its own entry, rather
-# than meeting the one cached before the change. The cache is kept only for a
-# signed-in caller: an anonymous one may have no storage at all.
+# than meeting the one cached before the change. The cache is kept in the
+# caller's storage, which an anonymous caller has only on an entity's route.
 def asset_serve(a, entity, service, asset, lifetime=asset_lifetime, public=False, version=None):
     # mochi.remote.stream aborts the action as a 500 on a malformed id, so
     # refuse one here as a 404 instead.
@@ -87,8 +87,14 @@ def asset_serve(a, entity, service, asset, lifetime=asset_lifetime, public=False
     name = asset_name(service, entity, asset)
     if version:
         name = name + "." + mochi.crypto.hash.sha256(str(version))[:16]
+    # An anonymous caller on an entity's route runs with the entity owner's
+    # storage, and keeps its entries apart there: the owner's own were fetched
+    # as the owner, and an anonymous caller is answered only what a fetch
+    # naming nobody is. Anonymous on a class route has no storage at all.
+    if a.user == None:
+        name = "anonymous/" + name
     record = name + ".json"
-    cached = a.user != None and mochi.text.valid(record, "filepath")
+    cached = (a.user != None or a.entity != None) and mochi.text.valid(record, "filepath")
     if cached:
         age = mochi.cache.age(record)
         if age != None and age < lifetime:
