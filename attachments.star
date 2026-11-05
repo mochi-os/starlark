@@ -99,9 +99,13 @@ attachment_variant_maximum = 16 * 1024 * 1024
 # and lists, medium for card and gallery tiles, preview for full-width views.
 attachment_variant_kinds = ["thumbnail", "medium", "preview"]
 
-# The most bytes of a stored file read back to learn its type from its
-# signature. core's own ceiling for a file read whole into a handler; an image
-# past it keeps the type it was declared with.
+# The bytes of a stored file read back to learn its type from its signature:
+# all attachment_sniff looks at.
+attachment_sniff_length = 4096
+
+# A core without mochi.file.head reads the whole file to look at its start, up
+# to its own ceiling for a file read whole into a handler; an image past it
+# keeps the type it was declared with.
 attachment_sniff_maximum = 32 * 1024 * 1024
 
 # attachment_relay_maximum bounds one relayed original (attachment_relay). A
@@ -261,7 +265,10 @@ def attachment_type(name, declared, file="", data=None):
     if not declared.lower().startswith("image/") and not attachment_content_type(name).startswith("image/"):
         return fallback
     if data == None and file and mochi.file.age(file) != None:
-        data = mochi.file.read(file, attachment_sniff_maximum)
+        if hasattr(mochi.file, "head"):
+            data = mochi.file.head(file, attachment_sniff_length)
+        else:
+            data = mochi.file.read(file, attachment_sniff_maximum)
     return attachment_sniff(data) or fallback
 
 # Writes a row at the end of object's order, choosing the rank inside the
