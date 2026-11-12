@@ -83,6 +83,11 @@ attachment_adopt_maximum = 32
 # back (or a lagging host that upgrades) heals without intervention.
 attachment_backoff_seconds = 300
 
+# How long a request waits for another transfer of the same original by the same
+# user - a second tab, a lightbox over its own tile, a retry - before answering
+# that it is still on its way.
+attachment_wait_seconds = 30
+
 # How often one user's orphan sweep runs for an app, and the cache marker whose
 # age keeps the count. The sweep lists the whole file root and queries every
 # row, a cost that scales with the store, and it used to be paid on every
@@ -800,7 +805,9 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
         # Only the container's canonical holder adopts, taking the bytes in on
         # first serve; a subscriber pulls to cache instead. The adopt pull opens
         # as the container entity - that is what the uploader's responder knows.
-        if adopt and attachment_adopt(id, container):
+        # A tile asked for is not held up waiting on its original, and an
+        # original already waited for here is not waited for again below.
+        if adopt and attachment_adopt(id, container, 0 if variant else attachment_wait_seconds):
             row = attachment_row(id)
         else:
             # a.write.cache answers False on a miss, and the cache is evictable
@@ -821,7 +828,7 @@ def attachment_serve(a, id, container, variant="", member=None, adopt=False):
                         return
                 if got == None:
                     break
-            pulled = attachment_pull(id, row, requester, "")
+            pulled = attachment_pull(id, row, requester, "", 0 if adopt else attachment_wait_seconds)
             if pulled:
                 if a.write.cache(attachment_cache_name(id, ""), content_type=kind):
                     return
@@ -1038,10 +1045,21 @@ def attachment_partial_name(id):
 # when present; None when the source could not be reached, False when it
 # answered and the bytes are not to be had. Failures back off, and the marker
 # records the class.
-def attachment_pull(id, row, requester, variant=""):
+def attachment_pull(id, row, requester, variant="", wait=attachment_wait_seconds):
     name = attachment_cache_name(id, variant)
     if mochi.cache.path(name):
         return True
+    # Another transfer of this original for this user is waited for, not
+    # raced: the request that lost the race answered 503 and marked a source
+    # that was answering as unreachable. Variants use no partial, so they
+    # never meet one.
+    partial = attachment_partial_name(id)
+    if not variant:
+        waited = mochi.cache.wait(name, partial, wait)
+        if waited == True:
+            return True
+        if waited == None:
+            return None
     marker = attachment_backoff_name(id, variant)
     age = mochi.cache.age(marker)
     if age != None and age < attachment_backoff_seconds:
@@ -1068,15 +1086,24 @@ def attachment_pull(id, row, requester, variant=""):
     # core carrying the primitives; anywhere else the path below is exactly
     # the whole-transfer one.
     declared = int(row.get("size", 0))
-    partial = attachment_partial_name(id)
+    if not variant and declared >= mochi.file.maximum():
+        # More than this platform stores: no transfer could bring it, so the
+        # source is not asked. A peer's claim, answered as refused.
+        mochi.log.debug("attachment_pull %s: declared size %d is past what can be stored", id, declared)
+        mochi.cache.write(marker, "refused")
+        return False
     offset = 0
+    # Set when the partial's bytes cannot be continued from: the append then
+    # starts it over under its hold. The partial is never deleted from out
+    # here, where another request's transfer may be appending to it.
+    restart = False
     if not variant and declared > 0:
         offset = mochi.cache.size(partial) or 0
         if offset >= declared:
             # A partial at or past the declared size cannot be right - the
-            # exactness check would have promoted a complete one.
-            mochi.cache.delete(partial)
+            # append would have moved a complete one into place.
             offset = 0
+            restart = True
     request = {"id": id, "object": row["object"], "variant": variant}
     if offset:
         request["offset"] = offset
@@ -1084,6 +1111,10 @@ def attachment_pull(id, row, requester, variant=""):
         {"from": requester, "to": entity, "service": services[0] if services else mochi.app.url(), "event": "attachment/fetch"},
         request)
     outcome = False
+    # Set when the append could not run here - another transfer held the
+    # partial, or this server's own state moved under it: nothing about the
+    # source, so no backoff is recorded against it.
+    contended = False
     if not stream:
         mochi.log.debug("attachment_pull %s: stream open to %s failed", id, entity)
         outcome = None
@@ -1103,30 +1134,35 @@ def attachment_pull(id, row, requester, variant=""):
             # partial rather than appending a second copy of the front.
             if offset and attachment_number(response.get("offset", 0)) != offset:
                 mochi.log.debug("attachment_pull %s: source restarted the transfer", id)
-                mochi.cache.delete(partial)
                 offset = 0
+                restart = True
             # Bound the transfer to the size the row declares, so a peer cannot
             # push gigabytes through the disk before the size check runs. Core
             # cuts one byte past the bound, so an overrun fails the check below.
             if not variant and declared > 0:
                 # Through the partial, so bytes survive an interruption and
-                # the next attempt continues instead of starting over.
-                total = mochi.cache.append(partial, stream, offset, maximum=declared - offset)
+                # the next attempt continues instead of starting over. The
+                # append finishes the transfer under its hold: a complete one is
+                # moved to the served name, an overrun deleted.
+                total = mochi.cache.append(partial, stream, offset, maximum=declared - offset, destination=name, restart=restart)
                 if total == None:
-                    # The primitive answers None when the transfer could not
-                    # run - the partial is held by another transfer, its size
-                    # moved under us, or the write failed - rather than
-                    # raising, which aborted the handler that was serving.
-                    # The transport class: whatever the partial holds stays
-                    # for the retry.
-                    outcome = None
+                    # The append could not run here - another transfer holds
+                    # the partial, or the partial moved under us (an eviction
+                    # between looks), or it could not be written or moved into
+                    # place. A transfer that began since the wait above is
+                    # waited for in turn; otherwise the request is unavailable
+                    # for now, with nothing recorded against the source.
+                    settled = mochi.cache.wait(name, partial, wait)
+                    if settled == True:
+                        outcome = True
+                    else:
+                        outcome = None
+                        contended = True
                 elif attachment_complete(total, declared, variant):
-                    mochi.cache.rename(partial, name)
                     outcome = True
                 elif total > declared:
-                    # A padded transfer poisons the partial; nothing in it can
-                    # be trusted to be our bytes.
-                    mochi.cache.delete(partial)
+                    # A padded transfer poisoned the partial, which the append
+                    # deleted: nothing in it could be trusted to be our bytes.
                     outcome = None
                 else:
                     # Short: the wire broke. The partial keeps what arrived,
@@ -1144,7 +1180,7 @@ def attachment_pull(id, row, requester, variant=""):
                     # retry may succeed - the transport class, not a verdict.
                     mochi.cache.delete(name)
                     outcome = None
-    if outcome != True:
+    if outcome != True and not contended:
         # Record the failure time and class; attachment_backoff_seconds later
         # the next access retries. cache.age reads the write time without
         # touching it.
@@ -1397,28 +1433,49 @@ def attachment_accept(rows, sender, object, requester=""):
     # P2P stream, so the batch is bounded well below the store's row cap.
     accepted = attachment_store(rows, sender, object)
     for id in accepted[:attachment_adopt_maximum]:
-        attachment_adopt(id, requester)
+        # No wait: message handlers run one at a time for the user and app,
+        # and a row this cannot adopt stays remote, pulled on first serve.
+        attachment_adopt(id, requester, 0)
     if len(accepted) > attachment_adopt_maximum:
         mochi.log.debug("attachment_accept adopted %d of %d rows", attachment_adopt_maximum, len(accepted))
     return len(accepted)
 
-# attachment_adopt(id, requester="") turns a remote-provenance row into an own
-# one: pull into cache, copy into file storage under the name every other host
-# knows, flip the row. The size is re-recorded from the copy, not the peer's
-# claim. Idempotent.
-def attachment_adopt(id, requester=""):
+# attachment_adopt(id, requester="", wait=attachment_wait_seconds) turns a
+# remote-provenance row into an own one: pull into cache, copy into file storage
+# under the name every other host knows, flip the row. The size is re-recorded
+# from the copy, not the peer's claim. Idempotent. wait is how long the pull
+# waits for another transfer of the original already in flight.
+def attachment_adopt(id, requester="", wait=attachment_wait_seconds):
     row = attachment_row(id)
     if not row:
         return False
     if not row.get("entity"):
         return True
-    if not attachment_pull(id, row, requester):
+    # Another request may be adopting it this moment. Its transfer is waited
+    # for and the row read again: that request moves the bytes into storage
+    # and drops the cached copy, so the copy waited for may already be gone,
+    # and pulling again would fetch the whole original a second time.
+    if mochi.cache.wait(attachment_cache_name(id), attachment_partial_name(id), wait) == None:
         return False
-    size = mochi.cache.copy(attachment_cache_name(id), attachment_filename(id, row["name"]))
+    row = attachment_row(id)
+    if not row:
+        return False
+    if not row.get("entity"):
+        return True
+    if not attachment_pull(id, row, requester, "", 0):
+        return False
+    # Another request that waited on the same transfer may be adopting it at
+    # this moment: the copy waits for that one's and answers its size, and is
+    # moved into place whole, never written over a file being served.
+    filename = attachment_filename(id, row["name"])
+    size = mochi.cache.copy(attachment_cache_name(id), filename)
     if size == None:
-        return False
+        # The cached copy is gone: another request adopted the attachment and
+        # dropped it, or the cache evicted it.
+        current = attachment_row(id)
+        return current != None and not current.get("entity")
     # The type too, now the bytes are ours to read: the row's was the peer's claim.
-    content_type = attachment_type(row["name"], row.get("content_type", ""), attachment_filename(id, row["name"]))
+    content_type = attachment_type(row["name"], row.get("content_type", ""), filename)
     mochi.db.execute("update attachments set entity='', size=?, content_type=? where id=?", size, content_type, id)
     # The remote-name cache entries are orphans once the row is ours; variants
     # re-render from the file under their own naming.
