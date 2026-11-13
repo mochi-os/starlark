@@ -42,11 +42,12 @@ def attachment_schema_create():
 # the rest of what a name may not use.
 attachment_component_maximum = 255
 
-# Room for the longest variant infix, "_thumbnail". A variant's cache entry is
-# the file name with the kind spliced in, so a name budgeted to the component
-# limit exactly produced variant names past it - rendering a long-named
-# image's thumbnail aborted the serve, and dropping one aborted the delete.
-attachment_variant_room = len("_thumbnail")
+# Room for the longest variant infix and suffix, "_thumbnail" and a converted
+# variant's ".jpg". A variant's cache entry is the file name with the kind
+# spliced in, so a name budgeted to the component limit exactly produced
+# variant names past it - rendering a long-named image's thumbnail aborted the
+# serve, and dropping one aborted the delete.
+attachment_variant_room = len("_thumbnail.jpg")
 
 # Ranks are database integers, and Starlark's are arbitrary precision, so the
 # ceiling matters as much as the floor: core bounded both through sl.AsInt32 and
@@ -738,20 +739,35 @@ def attachment_forget(row):
     if attachment_is_image(row["name"]):
         filename = attachment_filename(row["id"], row["name"])
         for kind in attachment_variant_kinds:
-            mochi.cache.delete("variants/" + attachment_variant_name(filename, kind))
+            for name in attachment_variant_names(filename, kind):
+                mochi.cache.delete("variants/" + name)
 
-# The cache entry stem core's variant renderer uses: the file name with the
-# kind spliced in ahead of the extension of the format the variant is encoded
-# in - the source's own, except a WebP's, which core encodes as JPEG.
-def attachment_variant_name(filename, kind):
+# The cache entry names core's variant renderer may keep a variant under: the
+# file name with the kind spliced in ahead of its extension, followed by ".jpg"
+# where the variant is a JPEG of another format - a WebP's always, an opaque
+# PNG's where that is clearly smaller.
+def attachment_variant_names(filename, kind):
     extension = ""
     index = filename.rfind(".")
     if index >= 0:
         extension = filename[index:]
         filename = filename[:index]
+    stem = filename + "_" + kind
     if extension.lower() == ".webp":
-        extension = ".jpg"
-    return filename + "_" + kind + extension
+        return [stem + extension + ".jpg"]
+    if extension.lower() == ".png":
+        return [stem + extension, stem + extension + ".jpg"]
+    return [stem + extension]
+
+# attachment_variant_answered(name, kind, rendered) -> string: The name a
+# responder gives the variant it sends: the attachment's name with the kind
+# spliced in, under the extension of the entry core rendered, which a relay
+# types the bytes by.
+def attachment_variant_answered(name, kind, rendered):
+    index = name.rfind(".")
+    stem = name[:index] if index >= 0 else name
+    dot = rendered.rfind(".")
+    return stem + "_" + kind + (rendered[dot:] if dot >= 0 else "")
 
 # attachment_variant_kind(kind) -> string: The kind to ask mochi.image.variant
 # for. A core from before mochi.image.kinds renders thumbnails and previews
@@ -766,12 +782,17 @@ def attachment_variant_kind(kind):
 # The content type of a variant pulled from an attachment's source. A variant
 # is encoded in its original's format except a WebP's, which is JPEG where the
 # source rendered one and the WebP itself where the source served the original
-# instead, so only that case reads the bytes.
+# instead, and a PNG's, which may be either PNG or JPEG; only those look at
+# the bytes, and only at their start where core can read just that.
 def attachment_pulled_type(row, entry):
-    named = mochi.file.type(attachment_variant_name(row["name"], "variant"))
-    if named == mochi.file.type(row["name"]):
+    names = attachment_variant_names(row["name"], "variant")
+    named = mochi.file.type(names[0])
+    if len(names) == 1 and named == mochi.file.type(row["name"]):
         return named
-    data = mochi.cache.read(entry, maximum=attachment_variant_maximum)
+    if hasattr(mochi.cache, "head"):
+        data = mochi.cache.head(entry, attachment_sniff_length)
+    else:
+        data = mochi.cache.read(entry, maximum=attachment_variant_maximum)
     return attachment_sniff(data) or named
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1229,9 @@ def attachment_complete(written, declared, variant=""):
         # A variant declares no size, so exactness is not available - but the
         # ceiling is: core cuts one byte past the bound, so a body that reaches
         # it is an overrun and must not be kept and served as the thumbnail.
-        return written < attachment_variant_maximum
+        # Nor is an empty one: no image encodes to nothing, so it is a source
+        # whose variant went between naming it and sending it.
+        return written > 0 and written < attachment_variant_maximum
     # Zero is a legitimate declaration - an empty file is a real attachment - so
     # it is held to its word rather than accepting any size.
     if declared == 0:
@@ -1260,12 +1283,12 @@ def attachment_respond(e, container, authorize, member=None):
     # so the subscriber pulls the small copy rather than the full image. A
     # variant that cannot be produced falls back to the original. The name
     # answered is the variant's, which the relay types the bytes by: a WebP's
-    # variant is a JPEG.
+    # variant is a JPEG, and a PNG's may be.
     variant = e.content("variant", "")
     if variant and attachment_is_image(row["name"]):
         name = mochi.image.variant(attachment_filename(id, row["name"]), attachment_variant_kind(variant))
         if name:
-            e.write({"status": "200", "name": attachment_variant_name(row["name"], variant)})
+            e.write({"status": "200", "name": attachment_variant_answered(row["name"], variant, name)})
             e.write.cache(name)
             return
 
