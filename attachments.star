@@ -1034,6 +1034,11 @@ def attachment_text(value, maximum):
 def attachment_number(value):
     kind = type(value)
     if kind == "float":
+        # int() raises on NaN and the infinities, and a peer's value reaches
+        # here, so one such field aborted the whole event handler. NaN is the
+        # one value unequal to itself; an infinity is past either bound.
+        if value != value or value < 0 or value > attachment_number_maximum:
+            return 0
         value = int(value)
     elif kind != "int":
         return 0
