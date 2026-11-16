@@ -1485,12 +1485,18 @@ def attachment_adopt(id, requester="", wait=attachment_wait_seconds):
     # and pulling again would fetch the whole original a second time.
     if mochi.cache.wait(attachment_cache_name(id), attachment_partial_name(id), wait) == None:
         return False
+    # The cached copy is looked for before the row is read. An adopter flips
+    # the row before it drops the copy, so a copy found here is not pulled
+    # again though that adopter may drop it a moment later - the copy below
+    # then finds it gone and reads the flipped row - and a copy not found with
+    # the row still remote means no adoption has finished.
+    held = mochi.cache.path(attachment_cache_name(id))
     row = attachment_row(id)
     if not row:
         return False
     if not row.get("entity"):
         return True
-    if not attachment_pull(id, row, requester, "", 0):
+    if not held and not attachment_pull(id, row, requester, "", 0):
         return False
     # Another request that waited on the same transfer may be adopting it at
     # this moment: the copy waits for that one's and answers its size, and is

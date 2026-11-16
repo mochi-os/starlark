@@ -3,3 +3,4 @@
 
 check:
 	python3 tools/check.py
+	python3 -B -m unittest discover -s tools -p 'test_*.py'
