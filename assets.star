@@ -161,9 +161,12 @@ def asset_serve(a, entity, service, asset, lifetime=asset_lifetime, public=False
     # storage, and keeps its entries apart there: the owner's own were fetched
     # as the owner, and an anonymous caller is answered only what a fetch
     # naming nobody is. Anonymous on a class route has no storage at all. A
-    # signed-in visitor to an entity a hosted domain publishes under a context
-    # runs with the owner's storage too, and keeps entries of their own there,
-    # fetched as themselves.
+    # signed-in caller runs with their own storage on every route, a hosted
+    # domain's included: only an action declared "site" moves them onto the
+    # owner's, and no asset action declares it. A core older than that rule
+    # still runs a signed-in visitor to an entity a hosted domain publishes
+    # under a context with the owner's storage, so their entries stay apart
+    # there, fetched as themselves.
     if a.user == None:
         name = "anonymous/" + name
     elif a.entity != None and not a.owner and a.domain.route != None and a.domain.route.context:
